@@ -39,6 +39,13 @@ properties:
       specific state and or you don't have control over the hard reset input of
       the register(s).
 
+  verify-readback:
+    type: boolean
+    description: |
+      The serial output of the last register is wired back to the SPI controller's MISO. After
+      every update the driver clocks the chain once more without touching the store clock (chip
+      select) and fails the update with -EIO if what comes back differs from what was written.
+
   ngpios:
     type: int
     required: true

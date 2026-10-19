@@ -34,6 +34,7 @@ struct gpio_sn74hc595_config {
 	struct gpio_dt_spec reset_gpio;
 
 	uint8_t num_registers;
+	bool verify_readback;
 };
 
 struct gpio_sn74hc595_drv_data {
@@ -41,6 +42,9 @@ struct gpio_sn74hc595_drv_data {
 
 	struct k_mutex lock;
 	uint32_t output;
+	/* A write failed on the bus: what the outputs show is unknown, so the next update must
+	 * always be sent, even if it equals the cached value. */
+	bool stale;
 };
 
 static int sn74hc595_write(const struct device *dev, uint32_t value)
@@ -60,9 +64,34 @@ static int sn74hc595_write(const struct device *dev, uint32_t value)
 	const struct spi_buf_set tx = {.buffers = tx_buf, .count = 1};
 
 	ret = spi_write_dt(&config->bus, &tx);
-
+	/* The outputs now show `value` (the store clock was pulsed), whatever the read-back says. */
 	if (ret == 0) {
 		drv_data->output = value;
+		drv_data->stale = false;
+	} else {
+		drv_data->stale = true;
+	}
+
+	if (ret == 0 && config->verify_readback) {
+		/* The last register's serial output (QH') is wired to MISO: clock the chain once
+		 * more WITHOUT touching the store clock (chip select) and compare. What was just
+		 * latched stays on the outputs; the register contents are overwritten by the next
+		 * write anyway.
+		 */
+		uint8_t zeros[sizeof(uint32_t)] = {0};
+		uint8_t back[sizeof(uint32_t)];
+		struct spi_config no_cs = config->bus.config;
+		struct spi_buf zbuf = {.buf = zeros, .len = config->num_registers};
+		struct spi_buf rbuf = {.buf = back, .len = config->num_registers};
+		const struct spi_buf_set ztx = {.buffers = &zbuf, .count = 1};
+		const struct spi_buf_set rrx = {.buffers = &rbuf, .count = 1};
+
+		no_cs.cs = (struct spi_cs_control){0};
+		ret = spi_transceive(config->bus.bus, &no_cs, &ztx, &rrx);
+		if (ret == 0 && memcmp(back, &adjusted_value, config->num_registers) != 0) {
+			LOG_ERR("read-back mismatch");
+			ret = -EIO;
+		}
 	}
 
 	return ret;
@@ -100,7 +129,7 @@ static int gpio_sn74hc595_port_set_masked_raw(const struct device *dev, uint32_t
 
 	/* check if we need to do something at all      */
 	/* current output differs from new masked value */
-	if ((drv_data->output & mask) != (mask & value)) {
+	if (drv_data->stale || (drv_data->output & mask) != (mask & value)) {
 		output = (drv_data->output & ~mask) | (mask & value);
 
 		ret = sn74hc595_write(dev, output);
@@ -225,6 +254,7 @@ static int gpio_sn74hc595_init(const struct device *dev)
 		.reset_gpio = GPIO_DT_SPEC_INST_GET_OR(n, reset_gpios, {0}),                       \
 		.enable_gpio = GPIO_DT_SPEC_INST_GET_OR(n, enable_gpios, {0}),                     \
 		.num_registers = DT_INST_PROP(n, ngpios) / BITS_PER_BYTE,                          \
+		.verify_readback = DT_INST_PROP(n, verify_readback),                          \
 	};                                                                                         \
                                                                                                    \
 	DEVICE_DT_DEFINE(DT_DRV_INST(n), &gpio_sn74hc595_init, NULL, &sn74hc595_data_##n,          \
