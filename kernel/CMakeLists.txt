@@ -113,6 +113,7 @@ else()
 
   kernel_sources_ifdef(CONFIG_TIMESLICING timeslicing.c)
   kernel_sources_ifdef(CONFIG_CLOCK_EVENT clock_event.c)
+  kernel_sources_ifdef(CONFIG_CLOCK_EVENT_SCHED clock_event_sched.c)
 	kernel_sources_ifdef(CONFIG_DEFERRED_RELEASE deferred_release.c)
   kernel_sources_ifdef(CONFIG_SCHED_DEADLINE deadline.c)
   kernel_sources_ifdef(CONFIG_SPIN_VALIDATE spinlock_validate.c)

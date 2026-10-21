@@ -12,6 +12,9 @@ static struct k_spinlock provider_lock;
 static struct k_clock_event_provider providers[CONFIG_CLOCK_EVENT_MAX_PROVIDERS];
 static size_t provider_count;
 
+/* Implemented by the scheduler clock service (clock_event_sched.c). */
+void z_clock_event_sched_provider_added(void);
+
 int k_clock_event_provider_register(const struct k_clock_event_backend *backend,
 				    void *context, uint32_t power_states)
 {
@@ -30,6 +33,9 @@ int k_clock_event_provider_register(const struct k_clock_event_backend *backend,
 				.backend = backend, .context = context, .power_states = power_states,
 			};
 		}
+	}
+	if (IS_ENABLED(CONFIG_CLOCK_EVENT_SCHED) && ret == 0) {
+		z_clock_event_sched_provider_added();
 	}
 	return ret;
 }
@@ -57,6 +63,33 @@ k_clock_event_provider_select(uint32_t required_power_states, uint32_t max_min_a
 		}
 	}
 	return best;
+}
+
+const struct k_clock_event_provider *k_clock_event_provider_get(size_t index)
+{
+	const struct k_clock_event_provider *provider = NULL;
+
+	K_SPINLOCK(&provider_lock) {
+		if (index < provider_count) {
+			provider = &providers[index];
+		}
+	}
+	return provider;
+}
+
+int k_clock_event_provider_bind(const struct k_clock_event_provider *provider,
+				struct k_clock_event *event,
+				k_clock_event_handler_t handler, void *user_data)
+{
+	if (provider == NULL) {
+		return -EINVAL;
+	}
+	if (provider->backend->event_init != NULL) {
+		return provider->backend->event_init(provider->context, event, handler,
+						     user_data);
+	}
+	return k_clock_event_init(event, provider->backend, provider->context, handler,
+				  user_data);
 }
 
 int k_clock_event_init(struct k_clock_event *event,
@@ -106,6 +139,17 @@ uint32_t k_clock_event_min_arm_cycles(const struct k_clock_event *event)
 	__ASSERT(event->backend != NULL, "clock event is not initialized");
 
 	return event->backend->min_arm_cycles(event->context);
+}
+
+uint32_t k_clock_event_frequency_hz(const struct k_clock_event *event)
+{
+	__ASSERT(event != NULL, "clock event is NULL");
+	__ASSERT(event->backend != NULL, "clock event is not initialized");
+
+	if (event->backend->frequency_hz == NULL) {
+		return 0U;
+	}
+	return event->backend->frequency_hz(event->context);
 }
 
 uint32_t k_clock_event_now(const struct k_clock_event *event)

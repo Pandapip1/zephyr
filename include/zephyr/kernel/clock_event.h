@@ -18,6 +18,7 @@
 #define ZEPHYR_INCLUDE_ZEPHYR_KERNEL_CLOCK_EVENT_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include <zephyr/spinlock.h>
@@ -78,6 +79,13 @@ struct k_clock_event_backend {
 	int (*arm_abs)(void *context, uint32_t deadline, uint32_t generation);
 	/** Cancel the currently armed provider alarm, if any. */
 	void (*cancel)(void *context);
+	/**
+	 * Optionally report the cycle-domain frequency in Hz.
+	 *
+	 * Required for providers used by the scheduler clock-event service, which
+	 * translates deadlines between provider domains.
+	 */
+	uint32_t (*frequency_hz)(void *context);
 };
 
 /** A registered provider and the power states in which it can deliver. */
@@ -133,8 +141,63 @@ int k_clock_event_provider_register(const struct k_clock_event_backend *backend,
 const struct k_clock_event_provider *
 k_clock_event_provider_select(uint32_t required_power_states, uint32_t max_min_arm_cycles);
 
+/**
+ * @brief Return the registered provider at @p index.
+ *
+ * @retval NULL @p index is not below the number of registered providers.
+ */
+const struct k_clock_event_provider *k_clock_event_provider_get(size_t index);
+
+/**
+ * @brief Bind @p event to @p provider.
+ *
+ * Uses the provider's @c event_init hook when it has one, otherwise
+ * @ref k_clock_event_init with the provider's backend and context.
+ */
+int k_clock_event_provider_bind(const struct k_clock_event_provider *provider,
+				struct k_clock_event *event,
+				k_clock_event_handler_t handler, void *user_data);
+
+/**
+ * @brief Bind @p event to the scheduler clock service.
+ *
+ * The event's cycle domain is the service's logical timebase, which counts
+ * CONFIG_CLOCK_EVENT_SCHED_FREQUENCY and is fed by every registered provider
+ * that reports a frequency (see @ref k_clock_event_sched_now). For each arm
+ * the service chooses the provider that delivers the deadline: the deep-sleep
+ * provider when the lead allows it, otherwise the fastest active-only
+ * provider, in which case it holds a power-management lock on every state
+ * deeper than @ref PM_STATE_RUNTIME_IDLE until the event fires or is
+ * cancelled. Clients never name a provider.
+ *
+ * @retval 0 Bound.
+ * @retval -ENODEV No deep-sleep provider with a frequency is registered.
+ * @retval -ENOMEM All CONFIG_CLOCK_EVENT_SCHED_CLIENTS slots are in use.
+ */
+int k_clock_event_sched_init(struct k_clock_event *event, k_clock_event_handler_t handler,
+			     void *user_data);
+
+/**
+ * @brief Read the scheduler clock service's logical time.
+ *
+ * A monotonic 64-bit count at CONFIG_CLOCK_EVENT_SCHED_FREQUENCY. While the
+ * CPU is in a state where the fastest active-only provider runs, it advances
+ * from that provider; across deeper PM states it advances from the deep-sleep
+ * provider. Returns 0 until a deep-sleep provider is registered.
+ */
+uint64_t k_clock_event_sched_now(void);
+
+/**
+ * @brief Number of scheduler clock events delivered later than their deadline plus
+ * CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS.
+ */
+uint32_t k_clock_event_sched_late_count(void);
+
 /** Return the provider's minimum reliable absolute-arm lead, in cycles. */
 uint32_t k_clock_event_min_arm_cycles(const struct k_clock_event *event);
+
+/** Return the event's cycle-domain frequency in Hz, or 0 if its provider reports none. */
+uint32_t k_clock_event_frequency_hz(const struct k_clock_event *event);
 
 /** Return the provider's current cycle count in its absolute-arm domain. */
 uint32_t k_clock_event_now(const struct k_clock_event *event);

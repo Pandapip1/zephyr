@@ -154,6 +154,75 @@ config CLOCK_EVENT_MAX_PROVIDERS
 	  Fixed registry capacity for optional selector clients. Direct clock-event
 	  bindings do not consume this storage.
 
+config CLOCK_EVENT_SCHED
+	bool "Scheduler clock service"
+	select CLOCK_EVENT
+	help
+	  Feed one logical monotonic timebase from every registered clock-event
+	  provider that reports a frequency, and let the kernel choose the
+	  provider for each clock-event arm: the deep-sleep provider when the
+	  lead allows it, otherwise the fastest active-only provider while
+	  holding a power-management lock on states deeper than runtime idle.
+	  Clients bind with k_clock_event_sched_init() and never name a provider.
+
+if CLOCK_EVENT_SCHED
+
+config CLOCK_EVENT_SCHED_FREQUENCY
+	int "Logical timebase frequency (Hz)"
+	default SYS_CLOCK_HW_CYCLES_PER_SEC if CLOCK_EVENT_SYSTEM_TIMER
+	default 33554432
+	help
+	  Rate of k_clock_event_sched_now() and of every scheduler clock-event
+	  deadline. Each provider's count is converted to this rate; a power of
+	  two times a 32768 Hz deep-sleep clock maps that clock exactly.
+
+config CLOCK_EVENT_SCHED_CLIENTS
+	int "Scheduler clock-event clients"
+	default 4
+	range 1 32
+	help
+	  Number of events that can be bound with k_clock_event_sched_init().
+	  Each binds one event on the deep-sleep and one on the active provider.
+
+config CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS
+	int "Delivery lateness counted as a missed deadline (ns)"
+	default 61036
+	help
+	  A clock event delivered more than this after its deadline is a missed
+	  deadline and is counted (k_clock_event_sched_late_count()). The
+	  default is two cycles of a 32768 Hz deep-sleep clock.
+
+config CLOCK_EVENT_SCHED_PANIC_ON_LATE
+	bool "Panic on a missed clock-event deadline"
+	default y if ASSERT
+	help
+	  Treat a clock event delivered later than
+	  CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS after its deadline as a fatal
+	  error. Intended for debug and test builds.
+
+config CLOCK_EVENT_SCHED_TRACE
+	bool "Trace scheduler clock decisions"
+	help
+	  Keep the most recent arms, provider expiries, hand-overs and
+	  deliveries in a ring buffer and print it with a missed-deadline report.
+
+config CLOCK_EVENT_SCHED_TRACE_ENTRIES
+	int "Scheduler clock trace entries"
+	depends on CLOCK_EVENT_SCHED_TRACE
+	default 32
+	range 4 256
+
+config CLOCK_EVENT_SCHED_DEEP_WAKE_NS
+	int "Deep-sleep wake budget (ns)"
+	default 0
+	help
+	  How far ahead of a deadline a deep-sleep provider arm wakes the CPU.
+	  Set it to cover the platform's deep-state exit latency, including
+	  restarting the active clock; the remainder is then armed on the active
+	  provider. With 0 the deep-sleep provider delivers the deadline itself.
+
+endif # CLOCK_EVENT_SCHED
+
 config DEFERRED_RELEASE
 	bool "Deferred deadline-event release"
 	depends on SCHED_DEADLINE
