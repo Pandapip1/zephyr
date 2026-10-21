@@ -51,9 +51,10 @@ their static priorities and deadlines are equal. The routine
 :c:func:`k_thread_deadline_set` is used to set a thread's deadline.
 
 For persistent event-handling threads, :c:func:`k_thread_release_with_deadline`
-atomically changes a suspended thread to ready while assigning its deadline.
-This is an explicit eligible-now transition: it does not wake a thread that is
-sleeping or pending on an object, so it does not change the not-before
+atomically changes a thread suspended only for that purpose to ready while
+assigning its deadline.  This is an explicit eligible-now transition: it does
+not wake a thread that is sleeping or pending on an object, so it does not
+change the not-before
 semantics of :c:type:`k_timeout_t`.  The :c:macro:`K_DEADLINE` helper constructs
 the absolute scheduler deadline from a relative cycle count.  As with the
 other deadline APIs, this deadline is a desired start-by point that orders

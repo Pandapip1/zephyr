@@ -34,6 +34,8 @@ int exec_order[NUM_THREADS];
 struct k_thread release_thread;
 K_THREAD_STACK_DEFINE(release_stack, STACK_SIZE);
 volatile int release_runs;
+struct k_thread release_sleep_thread;
+K_THREAD_STACK_DEFINE(release_sleep_stack, STACK_SIZE);
 
 #define RELEASE_ORDER_THREADS 2
 struct k_thread release_order_threads[RELEASE_ORDER_THREADS];
@@ -96,12 +98,14 @@ static void release_order_offload(const void *param)
 ZTEST(suite_deadline, test_release_with_deadline)
 {
 	k_tid_t tid;
+	k_tid_t sleeping_tid;
 
 	release_runs = 0;
 	tid = k_thread_create(&release_thread, release_stack, STACK_SIZE,
 			      release_worker, NULL, NULL, NULL,
-			      K_LOWEST_APPLICATION_THREAD_PRIO, K_SUSPENDED,
+			      K_LOWEST_APPLICATION_THREAD_PRIO, 0,
 			      K_NO_WAIT);
+	k_thread_suspend(tid);
 
 	zassert_equal(k_thread_release_with_deadline(tid,
 					     K_DEADLINE(MSEC_TO_CYCLES(10))), 0,
@@ -109,6 +113,17 @@ ZTEST(suite_deadline, test_release_with_deadline)
 	zassert_equal(k_thread_release_with_deadline(tid,
 					     K_DEADLINE(MSEC_TO_CYCLES(10))), -EALREADY,
 		      "already-ready thread was released");
+
+	/* Suspension must not turn a delayed thread into an eligible job. */
+	sleeping_tid = k_thread_create(&release_sleep_thread, release_sleep_stack,
+				      STACK_SIZE, release_worker, NULL, NULL, NULL,
+				      K_LOWEST_APPLICATION_THREAD_PRIO, 0, K_FOREVER);
+	k_thread_suspend(sleeping_tid);
+	zassert_equal(k_thread_release_with_deadline(sleeping_tid,
+					     K_DEADLINE(MSEC_TO_CYCLES(10))), -EALREADY,
+		      "sleeping thread was released");
+	k_thread_abort(sleeping_tid);
+
 	k_sleep(K_MSEC(10));
 	zassert_equal(release_runs, 1, "released thread did not run once");
 	k_thread_abort(tid);
@@ -129,13 +144,15 @@ ZTEST(suite_deadline, test_release_with_deadline_order)
 	args.later = k_thread_create(&release_order_threads[0],
 				     release_order_stacks[0], STACK_SIZE,
 				     release_order_worker, INT_TO_POINTER(0), NULL, NULL,
-				     K_LOWEST_APPLICATION_THREAD_PRIO, K_SUSPENDED,
+				     K_LOWEST_APPLICATION_THREAD_PRIO, 0,
 				     K_NO_WAIT);
 	args.earlier = k_thread_create(&release_order_threads[1],
 				       release_order_stacks[1], STACK_SIZE,
 				       release_order_worker, INT_TO_POINTER(1), NULL, NULL,
-				       K_LOWEST_APPLICATION_THREAD_PRIO, K_SUSPENDED,
+				       K_LOWEST_APPLICATION_THREAD_PRIO, 0,
 				       K_NO_WAIT);
+	k_thread_suspend(args.later);
+	k_thread_suspend(args.earlier);
 
 	/* K_DEADLINE produces absolute, distinct EDF ordering keys. */
 	args.later_deadline = K_DEADLINE(MSEC_TO_CYCLES(20));

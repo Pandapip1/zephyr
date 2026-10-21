@@ -1207,11 +1207,11 @@ __syscall void k_thread_absolute_deadline_set(k_tid_t thread, int deadline);
 /**
  * @brief Make a suspended persistent thread eligible with a deadline.
  *
- * This atomically assigns @p deadline and moves a suspended thread to the
- * ready queue. It is intended for persistent threads which suspend
- * themselves while idle and are explicitly released by an event source.
- * In particular, it does not cancel or shorten a @ref k_timeout_t: a sleeping
- * or pended thread is not released by this API.
+ * This atomically assigns @p deadline and moves a thread whose only
+ * run-preventing state is suspension to the ready queue. It is intended for
+ * persistent threads which suspend themselves while idle and are explicitly
+ * released by an event source. In particular, it does not cancel or shorten a
+ * @ref k_timeout_t: a sleeping or pended thread is not released by this API.
  *
  * If called from an ISR, normal interrupt-exit scheduling selects the next
  * thread; this API never invokes a thread inline from the ISR.
@@ -1225,7 +1225,8 @@ __syscall void k_thread_absolute_deadline_set(k_tid_t thread, int deadline);
  *                 @ref K_DEADLINE for a deadline relative to the call site.
  *
  * @retval 0 The thread transitioned from suspended to ready.
- * @retval -EALREADY The thread was not suspended.
+ * @retval -EALREADY The thread was not suspended alone (for example, it is
+ *                   already ready, sleeping, or pended).
  */
 __syscall int k_thread_release_with_deadline(k_tid_t thread, int deadline);
 #endif

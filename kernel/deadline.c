@@ -90,7 +90,8 @@ int z_impl_k_thread_release_with_deadline(k_tid_t tid, int deadline)
 	 * API into a timeout wakeup: sleepers and object waiters retain their
 	 * K_TIMEOUT release semantics.
 	 */
-	if (unlikely(!z_is_thread_suspended(thread))) {
+	if (unlikely(!z_is_thread_suspended(thread) ||
+		     (thread->base.thread_state & ~_THREAD_SUSPENDED) != 0U)) {
 		z_sched_spinlock_unlock(key);
 		return -EALREADY;
 	}
