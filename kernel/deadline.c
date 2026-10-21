@@ -26,6 +26,90 @@
 #include <zephyr/logging/log.h>
 #include <errno.h>
 
+void z_impl_k_deadline_event_init(struct k_deadline_event *event)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	event->consumer = NULL;
+	event->pending = false;
+	z_sched_spinlock_unlock(key);
+}
+
+void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	struct k_thread *thread = event->consumer;
+
+	/* A set bit is the complete coalescing state; never count publications. */
+	event->pending = true;
+	if ((thread != NULL) && z_is_thread_suspended(thread) &&
+	    ((thread->base.thread_state & ~_THREAD_SUSPENDED) == 0U)) {
+		/* Assign the EDF key before making the consumer observable as ready. */
+		thread->base.prio_deadline = deadline;
+		z_mark_thread_as_not_suspended(thread);
+		z_sched_ready_locked(thread);
+		z_reschedule_locked(key);
+	} else {
+		z_sched_spinlock_unlock(key);
+	}
+}
+
+void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
+{
+	struct k_thread *thread = k_current_get();
+
+	__ASSERT(!arch_is_in_isr(), "deadline event wait from ISR");
+
+	for (;;) {
+		k_spinlock_key_t key = z_sched_spinlock_lock();
+
+		if (event->consumer == NULL) {
+			event->consumer = thread;
+		} else {
+			__ASSERT(event->consumer == thread,
+				 "deadline event has more than one consumer");
+		}
+
+		if (event->pending) {
+			event->pending = false;
+			z_sched_spinlock_unlock(key);
+			return;
+		}
+
+		/*
+		 * z_thread_halt() changes the current thread to suspended before it
+		 * releases the scheduler lock.  A post therefore either observes the
+		 * pending bit above or releases this pure-suspended consumer; there is
+		 * no lost-publication window between the two operations.
+		 */
+		z_thread_halt(thread, key, false);
+	}
+}
+
+#ifdef CONFIG_USERSPACE
+static inline void z_vrfy_k_deadline_event_init(struct k_deadline_event *event)
+{
+	K_OOPS(K_SYSCALL_OBJ_INIT(event, K_OBJ_DEADLINE_EVENT));
+	z_impl_k_deadline_event_init(event);
+}
+#include <zephyr/syscalls/k_deadline_event_init_mrsh.c>
+
+static inline void z_vrfy_k_deadline_event_post(struct k_deadline_event *event,
+						 int deadline)
+{
+	K_OOPS(K_SYSCALL_OBJ(event, K_OBJ_DEADLINE_EVENT));
+	z_impl_k_deadline_event_post(event, deadline);
+}
+#include <zephyr/syscalls/k_deadline_event_post_mrsh.c>
+
+static inline void z_vrfy_k_deadline_event_wait(struct k_deadline_event *event)
+{
+	K_OOPS(K_SYSCALL_OBJ(event, K_OBJ_DEADLINE_EVENT));
+	z_impl_k_deadline_event_wait(event);
+}
+#include <zephyr/syscalls/k_deadline_event_wait_mrsh.c>
+#endif
+
 /**
  * @brief Atomically update a thread's prio_deadline in the run queue.
  *

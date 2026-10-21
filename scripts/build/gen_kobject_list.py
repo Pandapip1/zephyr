@@ -108,6 +108,7 @@ kobjects = OrderedDict(
         ("sys_mutex", (None, True, False)),
         ("k_condvar", (None, False, True)),
         ("k_event", ("CONFIG_EVENTS", False, True)),
+        ("k_deadline_event", ("CONFIG_SCHED_DEADLINE", False, True)),
         ("ztest_suite_node", ("CONFIG_ZTEST", True, False)),
         ("ztest_suite_stats", ("CONFIG_ZTEST", True, False)),
         ("ztest_unit_test", ("CONFIG_ZTEST", True, False)),

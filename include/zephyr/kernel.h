@@ -1111,6 +1111,68 @@ __syscall void k_thread_priority_set(k_tid_t thread, int prio);
 
 #ifdef CONFIG_SCHED_DEADLINE
 /**
+ * @brief One-bit event latch for a deadline-scheduled persistent thread.
+ *
+ * A deadline event has one consumer.  Posting coalesces while its event is
+ * pending.  The consumer atomically consumes a pending event or suspends
+ * itself; posting atomically records the event and, when necessary, releases
+ * that suspended consumer with an EDF ordering key.
+ *
+ * The fields are internal.  Initialize with @ref K_DEADLINE_EVENT_DEFINE or
+ * @ref k_deadline_event_init before use.
+ */
+struct k_deadline_event {
+	struct k_thread *consumer;
+	bool pending;
+};
+
+/** @cond INTERNAL_HIDDEN */
+#define Z_DEADLINE_EVENT_INITIALIZER { .consumer = NULL, .pending = false }
+/** @endcond */
+
+/**
+ * @brief Statically define a deadline event.
+ *
+ * @param name Name of the event object.
+ */
+#define K_DEADLINE_EVENT_DEFINE(name) \
+	struct k_deadline_event name = Z_DEADLINE_EVENT_INITIALIZER
+
+/**
+ * @brief Initialize a deadline event.
+ *
+ * Initialization must not race with posting or waiting.
+ *
+ * @param event Deadline event to initialize.
+ */
+__syscall void k_deadline_event_init(struct k_deadline_event *event);
+
+/**
+ * @brief Post a coalescing event and release its suspended consumer.
+ *
+ * The first call binds the consumer when it waits.  A post before that time
+ * remains latched and is consumed by that first wait.  If the consumer is
+ * already ready or running, the event remains latched for its next wait.
+ *
+ * @isr_ok
+ *
+ * @param event Deadline event to post.
+ * @param deadline Absolute timestamp in @ref k_cycle_get_32 units used if a
+ *                 suspended consumer is released.
+ */
+__syscall void k_deadline_event_post(struct k_deadline_event *event, int deadline);
+
+/**
+ * @brief Consume a pending event or atomically suspend the calling consumer.
+ *
+ * A deadline event supports exactly one consumer thread.  This routine must
+ * be called in thread context.  On return, one posted event was consumed.
+ *
+ * @param event Deadline event to wait on.
+ */
+__syscall void k_deadline_event_wait(struct k_deadline_event *event);
+
+/**
  * @brief Construct an absolute scheduler deadline from a relative cycle count.
  *
  * A deadline is a latest desired start-by scheduling point, distinct from a

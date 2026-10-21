@@ -51,6 +51,43 @@ struct release_order_args {
 	int earlier_deadline;
 };
 
+K_DEADLINE_EVENT_DEFINE(event_latch);
+K_SEM_DEFINE(event_latch_armed, 0, 1);
+K_SEM_DEFINE(event_latch_done, 0, 1);
+struct k_thread event_latch_thread;
+K_THREAD_STACK_DEFINE(event_latch_stack, STACK_SIZE);
+volatile int event_latch_runs;
+
+static void event_latch_post_twice(const void *param)
+{
+	struct k_deadline_event *event = (struct k_deadline_event *)param;
+
+	/* Both publications occur before IRQ-exit scheduling and must coalesce. */
+	k_deadline_event_post(event, K_DEADLINE(MSEC_TO_CYCLES(20)));
+	k_deadline_event_post(event, K_DEADLINE(MSEC_TO_CYCLES(10)));
+}
+
+static void event_latch_worker(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	/* Once main can run, this thread is atomically waiting/suspended. */
+	k_sem_give(&event_latch_armed);
+	k_deadline_event_wait(&event_latch);
+	event_latch_runs++;
+
+	/* Publish while the consumer is running, then consume without sleeping. */
+	irq_offload(event_latch_post_twice, &event_latch);
+	k_deadline_event_wait(&event_latch);
+	event_latch_runs++;
+	k_sem_give(&event_latch_done);
+
+	/* Keep the persistent consumer alive but no longer runnable. */
+	k_deadline_event_wait(&event_latch);
+}
+
 static void release_worker(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -171,6 +208,34 @@ ZTEST(suite_deadline, test_release_with_deadline_order)
 	for (int i = 0; i < RELEASE_ORDER_THREADS; i++) {
 		k_thread_abort(&release_order_threads[i]);
 	}
+}
+
+/**
+ * @brief Verify an IRQ-posted deadline event never loses a running-consumer wake.
+ *
+ * Two posts while the consumer is suspended coalesce into one consumption.  A
+ * subsequent pair posted from an IRQ while that consumer is running remains
+ * latched and is consumed immediately at its next wait, rather than being lost
+ * because the thread was not suspended at publication time.
+ */
+ZTEST(suite_deadline, test_deadline_event_irq_latch)
+{
+	event_latch_runs = 0;
+	k_deadline_event_init(&event_latch);
+	k_sem_reset(&event_latch_armed);
+	k_sem_reset(&event_latch_done);
+
+	(void)k_thread_create(&event_latch_thread, event_latch_stack, STACK_SIZE,
+			      event_latch_worker, NULL, NULL, NULL,
+			      K_HIGHEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
+	k_sem_take(&event_latch_armed, K_FOREVER);
+
+	irq_offload(event_latch_post_twice, &event_latch);
+	k_sem_take(&event_latch_done, K_FOREVER);
+
+	zassert_equal(event_latch_runs, 2,
+		      "coalesced IRQ publication was lost or consumed more than once");
+	k_thread_abort(&event_latch_thread);
 }
 
 void worker(void *p1, void *p2, void *p3)
