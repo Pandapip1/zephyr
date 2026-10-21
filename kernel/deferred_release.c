@@ -4,13 +4,15 @@
 
 #include <zephyr/kernel/deferred_release.h>
 
-static void deferred_release_fire(struct k_clock_event *clock_event, void *user_data)
+static void deferred_release_fire(struct k_clock_event *clock_event, uint32_t generation,
+				  void *user_data)
 {
 	struct k_deferred_release *release = user_data;
 	struct k_deadline_event *event = NULL;
 	int deadline = 0;
 
 	ARG_UNUSED(clock_event);
+	ARG_UNUSED(generation);
 	K_SPINLOCK(&release->lock) {
 		if (release->armed) {
 			release->armed = false;

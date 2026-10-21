@@ -55,9 +55,11 @@ static struct fake_provider selected_provider = {
 	.min_lead = 3U,
 };
 
-static void unused_clock_event_handler(struct k_clock_event *event, void *user_data)
+static void unused_clock_event_handler(struct k_clock_event *event, uint32_t generation,
+				       void *user_data)
 {
 	ARG_UNUSED(event);
+	ARG_UNUSED(generation);
 	ARG_UNUSED(user_data);
 }
 

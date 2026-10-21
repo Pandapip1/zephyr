@@ -116,7 +116,8 @@ uint32_t k_clock_event_now(const struct k_clock_event *event)
 	return event->backend->now(event->context);
 }
 
-int k_clock_event_arm_abs(struct k_clock_event *event, uint32_t deadline)
+int k_clock_event_arm_abs_with_generation(struct k_clock_event *event, uint32_t deadline,
+					  uint32_t *generation)
 {
 	int ret;
 
@@ -144,10 +145,18 @@ int k_clock_event_arm_abs(struct k_clock_event *event, uint32_t deadline)
 		ret = event->backend->arm_abs(event->context, deadline, event->generation);
 		if (ret == 0) {
 			event->armed = true;
+			if (generation != NULL) {
+				*generation = event->generation;
+			}
 		}
 	}
 
 	return ret;
+}
+
+int k_clock_event_arm_abs(struct k_clock_event *event, uint32_t deadline)
+{
+	return k_clock_event_arm_abs_with_generation(event, deadline, NULL);
 }
 
 void k_clock_event_cancel(struct k_clock_event *event)
@@ -181,6 +190,6 @@ void k_clock_event_fire(struct k_clock_event *event, uint32_t generation)
 	}
 
 	if (handler != NULL) {
-		handler(event, user_data);
+		handler(event, generation, user_data);
 	}
 }

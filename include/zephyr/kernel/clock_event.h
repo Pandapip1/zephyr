@@ -34,8 +34,16 @@ struct k_clock_event;
 /** Provider remains usable in the platform's deepest retained sleep state. */
 #define K_CLOCK_EVENT_POWER_DEEP_SLEEP BIT(1)
 
-/** @brief Callback invoked when an armed clock event expires. */
-typedef void (*k_clock_event_handler_t)(struct k_clock_event *event, void *user_data);
+/**
+ * @brief Callback invoked when an armed clock event expires.
+ *
+ * @p generation identifies the particular successful arm that expired.  It is
+ * supplied so clients that keep their own arm payload can reject a callback
+ * captured before a replacement/cancel race without consulting mutable
+ * "latest arm" state.
+ */
+typedef void (*k_clock_event_handler_t)(struct k_clock_event *event,
+					uint32_t generation, void *user_data);
 
 /**
  * @brief Optional hardware clock-event provider operations.
@@ -140,6 +148,16 @@ uint32_t k_clock_event_now(const struct k_clock_event *event);
  * work eligible early—the caller decides how to handle a late arm.
  */
 int k_clock_event_arm_abs(struct k_clock_event *event, uint32_t deadline);
+
+/**
+ * @brief Arm an absolute event and return the generation assigned to this arm.
+ *
+ * This is otherwise identical to @ref k_clock_event_arm_abs.  Callers that
+ * associate private payload with an arm should keep the returned generation
+ * with that payload and compare it in their expiry callback.
+ */
+int k_clock_event_arm_abs_with_generation(struct k_clock_event *event,
+					    uint32_t deadline, uint32_t *generation);
 
 /** Cancel an event and invalidate any stale provider callback. */
 void k_clock_event_cancel(struct k_clock_event *event);

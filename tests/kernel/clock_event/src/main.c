@@ -54,12 +54,15 @@ static const struct k_clock_event_backend fake_backend = {
 
 K_CLOCK_EVENT_DEFINE(event);
 static unsigned int publications;
+static uint32_t published_generation;
 
-static void publish_event(struct k_clock_event *clock_event, void *user_data)
+static void publish_event(struct k_clock_event *clock_event, uint32_t generation,
+			  void *user_data)
 {
 	ARG_UNUSED(clock_event);
 	ARG_UNUSED(user_data);
 	publications++;
+	published_generation = generation;
 }
 
 static void reset_event(struct fake_clock_event_provider *provider)
@@ -69,6 +72,7 @@ static void reset_event(struct fake_clock_event_provider *provider)
 		.min_lead = 5U,
 	};
 	publications = 0U;
+	published_generation = 0U;
 	zassert_equal(k_clock_event_init(&event, &fake_backend, provider,
 				   publish_event, NULL), 0, "event init failed");
 }
@@ -88,6 +92,8 @@ ZTEST(clock_event, test_absolute_arm_and_callback_publication)
 	/* This models a provider IRQ; the generic layer publishes once. */
 	k_clock_event_fire(&event, provider.generation);
 	zassert_equal(publications, 1U, "expiry callback was not published");
+	zassert_equal(published_generation, provider.generation,
+		      "expiry did not carry its arm generation");
 	k_clock_event_fire(&event, provider.generation);
 	zassert_equal(publications, 1U, "expired generation published twice");
 }
@@ -121,11 +127,18 @@ ZTEST(clock_event, test_cancel_and_replacement_discard_stale_callback)
 {
 	struct fake_clock_event_provider provider;
 	uint32_t old_generation;
+	uint32_t replacement_generation;
 
 	reset_event(&provider);
 	zassert_equal(k_clock_event_arm_abs(&event, 110U), 0, "first arm failed");
 	old_generation = provider.generation;
-	zassert_equal(k_clock_event_arm_abs(&event, 120U), 0, "replacement arm failed");
+	zassert_equal(k_clock_event_arm_abs_with_generation(&event, 120U,
+						     &replacement_generation), 0,
+		      "replacement arm failed");
+	zassert_not_equal(replacement_generation, old_generation,
+			  "replacement reused old generation");
+	zassert_equal(replacement_generation, provider.generation,
+		      "returned generation was not the provider arm");
 	zassert_equal(provider.cancel_calls, 1U, "replacement did not cancel old arm");
 	k_clock_event_fire(&event, old_generation);
 	zassert_equal(publications, 0U, "stale replacement callback published");
