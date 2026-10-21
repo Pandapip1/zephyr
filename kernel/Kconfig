@@ -145,6 +145,15 @@ config CLOCK_EVENT
 	  This is separate from the system-clock timeout API and does not alter
 	  K_TIMEOUT semantics. No provider is selected automatically.
 
+config CLOCK_EVENT_MAX_PROVIDERS
+	int "Maximum registered clock-event providers"
+	depends on CLOCK_EVENT
+	default 4
+	range 1 32
+	help
+	  Fixed registry capacity for optional selector clients. Direct clock-event
+	  bindings do not consume this storage.
+
 config DEFERRED_RELEASE
 	bool "Deferred deadline-event release"
 	depends on SCHED_DEADLINE

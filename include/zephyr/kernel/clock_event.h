@@ -29,6 +29,11 @@ extern "C" {
 
 struct k_clock_event;
 
+/** Provider remains usable while the CPU is active. */
+#define K_CLOCK_EVENT_POWER_ACTIVE BIT(0)
+/** Provider remains usable in the platform's deepest retained sleep state. */
+#define K_CLOCK_EVENT_POWER_DEEP_SLEEP BIT(1)
+
 /** @brief Callback invoked when an armed clock event expires. */
 typedef void (*k_clock_event_handler_t)(struct k_clock_event *event, void *user_data);
 
@@ -56,6 +61,13 @@ struct k_clock_event_backend {
 	int (*arm_abs)(void *context, uint32_t deadline, uint32_t generation);
 	/** Cancel the currently armed provider alarm, if any. */
 	void (*cancel)(void *context);
+};
+
+/** A registered provider and the power states in which it can deliver. */
+struct k_clock_event_provider {
+	const struct k_clock_event_backend *backend;
+	void *context;
+	uint32_t power_states;
 };
 
 /**
@@ -89,6 +101,20 @@ int k_clock_event_init(struct k_clock_event *event,
 /** Replace an unarmed event's handler. Returns -EBUSY while armed. */
 int k_clock_event_set_handler(struct k_clock_event *event,
 			    k_clock_event_handler_t handler, void *user_data);
+
+/**
+ * @brief Register an optional provider for selector clients.
+ *
+ * Direct @ref k_clock_event_init users need not register. Providers selected
+ * together must use the same cycle domain; @p max_min_arm_cycles is measured
+ * in that domain. Registration is intended for device initialization.
+ */
+int k_clock_event_provider_register(const struct k_clock_event_backend *backend,
+				    void *context, uint32_t power_states);
+
+/** Select the lowest-lead provider satisfying power and arm-lead requirements. */
+const struct k_clock_event_provider *
+k_clock_event_provider_select(uint32_t required_power_states, uint32_t max_min_arm_cycles);
 
 /** Return the provider's minimum reliable absolute-arm lead, in cycles. */
 uint32_t k_clock_event_min_arm_cycles(const struct k_clock_event *event);

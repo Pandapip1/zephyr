@@ -8,6 +8,57 @@
 
 #include <zephyr/kernel/clock_event.h>
 
+static struct k_spinlock provider_lock;
+static struct k_clock_event_provider providers[CONFIG_CLOCK_EVENT_MAX_PROVIDERS];
+static size_t provider_count;
+
+int k_clock_event_provider_register(const struct k_clock_event_backend *backend,
+				    void *context, uint32_t power_states)
+{
+	int ret = 0;
+
+	if ((backend == NULL) || (backend->now == NULL) ||
+	    (backend->min_arm_cycles == NULL) || (backend->arm_abs == NULL) ||
+	    (backend->cancel == NULL) || (power_states == 0U)) {
+		return -EINVAL;
+	}
+	K_SPINLOCK(&provider_lock) {
+		if (provider_count == ARRAY_SIZE(providers)) {
+			ret = -ENOMEM;
+		} else {
+			providers[provider_count++] = (struct k_clock_event_provider) {
+				.backend = backend, .context = context, .power_states = power_states,
+			};
+		}
+	}
+	return ret;
+}
+
+const struct k_clock_event_provider *
+k_clock_event_provider_select(uint32_t required_power_states, uint32_t max_min_arm_cycles)
+{
+	const struct k_clock_event_provider *best = NULL;
+	uint32_t best_lead = UINT32_MAX;
+
+	K_SPINLOCK(&provider_lock) {
+		for (size_t i = 0U; i < provider_count; i++) {
+			const struct k_clock_event_provider *candidate = &providers[i];
+			uint32_t lead;
+
+			if ((candidate->power_states & required_power_states) !=
+			    required_power_states) {
+				continue;
+			}
+			lead = candidate->backend->min_arm_cycles(candidate->context);
+			if ((lead <= max_min_arm_cycles) && (lead < best_lead)) {
+				best = candidate;
+				best_lead = lead;
+			}
+		}
+	}
+	return best;
+}
+
 int k_clock_event_init(struct k_clock_event *event,
 		       const struct k_clock_event_backend *backend, void *context,
 		       k_clock_event_handler_t handler, void *user_data)

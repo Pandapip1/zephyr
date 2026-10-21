@@ -592,6 +592,15 @@ static int counter_silabs_init(const struct device *dev)
 	burtc_cfg->irq_config();
 #if defined(CONFIG_GECKO_BURTC_TIMER)
 	counter_silabs_rearm_compare(data, sl_hal_burtc_get_counter());
+#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+	err = k_clock_event_provider_register(&counter_silabs_clock_event_backend,
+					      (void *)dev,
+					      K_CLOCK_EVENT_POWER_ACTIVE |
+					      K_CLOCK_EVENT_POWER_DEEP_SLEEP);
+	if (err != 0) {
+		return err;
+	}
+#endif
 #endif
 	LOG_INF("Device %s initialized", dev->name);
 	return 0;
