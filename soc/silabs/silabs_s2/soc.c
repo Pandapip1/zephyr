@@ -58,7 +58,7 @@ void soc_early_init_hook(void)
 		sl_hfxo_manager_init_hardware();
 		sl_hfxo_manager_init();
 	}
-	if (IS_ENABLED(CONFIG_PM)) {
+	if (IS_ENABLED(CONFIG_SILABS_SISDK_POWER_MANAGER)) {
 		sl_power_manager_init();
 	}
 	if (IS_ENABLED(CONFIG_SOC_GECKO_USE_RAIL)) {

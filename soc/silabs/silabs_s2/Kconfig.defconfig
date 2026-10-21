@@ -6,19 +6,23 @@ rsource "*/Kconfig.defconfig"
 if SOC_FAMILY_SILABS_S2
 
 configdefault SYS_CLOCK_HW_CYCLES_PER_SEC
+	# 2^25 Hz: BURTC at 32768 Hz maps to whole logical cycles.
+	default 33554432 if CLOCK_EVENT_SYSTEM_TIMER
 	default $(dt_node_int_prop_int,/cpus/cpu@0,clock-frequency) if CORTEX_M_SYSTICK
 	default 32768
 
 configdefault SYS_CLOCK_TICKS_PER_SEC
+	default 32768 if CLOCK_EVENT_SYSTEM_TIMER
 	default 128 if !TICKLESS_KERNEL && (SILABS_SLEEPTIMER_TIMER || GECKO_BURTC_TIMER)
 	default 32768 if SILABS_SLEEPTIMER_TIMER
 	default 1024 if GECKO_BURTC_TIMER
 
 configdefault SILABS_SLEEPTIMER_TIMER
+	default n if CLOCK_EVENT_SYSTEM_TIMER
 	default y
 
 configdefault CORTEX_M_SYSTICK
-	default n if SILABS_SLEEPTIMER_TIMER || GECKO_BURTC_TIMER
+	default n if SILABS_SLEEPTIMER_TIMER || GECKO_BURTC_TIMER || CLOCK_EVENT_SYSTEM_TIMER
 
 configdefault CLOCK_CONTROL
 	default y
@@ -39,13 +43,21 @@ configdefault ZERO_LATENCY_LEVELS
 configdefault SILABS_SISDK_HFXO_MANAGER
 	default y if PM && $(dt_nodelabel_enabled,sysrtc0) && $(dt_nodelabel_enabled,hfxo)
 
+# The power manager schedules its wake-ups on the sleeptimer. With the scheduler clock as
+# system timer, PM states are entered through emlib's EMU directly (soc_power.c).
 configdefault SILABS_SISDK_POWER_MANAGER
+	default n if CLOCK_EVENT_SYSTEM_TIMER
 	default y if PM
+
+configdefault SILABS_SISDK_EMU
+	default y if PM && CLOCK_EVENT_SYSTEM_TIMER
 
 # With sl_power_manager, pm_state_set()'s stack footprint is noticeably
 # large, especially with logs enabled. Since it is called from IDLE task,
 # its stack size has to be increased
 configdefault IDLE_STACK_SIZE
+	# Idle entry arms the next wake-up through the scheduler clock service (about 300 bytes).
+	default 640 if PM && CLOCK_EVENT_SYSTEM_TIMER
 	default 512 if PM
 
 configdefault NUM_METAIRQ_PRIORITIES
