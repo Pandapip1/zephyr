@@ -437,6 +437,10 @@ if(CONFIG_SILABS_SISDK_I2C)
     ${service_dir}/udelay/src/sl_udelay.c
     ${peripheral_dir}/src/sl_hal_i2c.c
   )
+  if(NOT CONFIG_SILABS_SISDK_SLEEPTIMER)
+    # sl_i2c.c times out on sleeptimer ticks; answer from Zephyr's uptime instead.
+    zephyr_library_sources(src/sl_sleeptimer_shim.c)
+  endif()
 endif()
 
 # GPCRC
