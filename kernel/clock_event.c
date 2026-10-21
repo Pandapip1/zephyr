@@ -30,12 +30,39 @@ int k_clock_event_init(struct k_clock_event *event,
 	return 0;
 }
 
+int k_clock_event_set_handler(struct k_clock_event *event,
+			    k_clock_event_handler_t handler, void *user_data)
+{
+	int ret = 0;
+
+	if ((event == NULL) || (event->backend == NULL) || (handler == NULL)) {
+		return -EINVAL;
+	}
+	K_SPINLOCK(&event->lock) {
+		if (event->armed) {
+			ret = -EBUSY;
+		} else {
+			event->handler = handler;
+			event->user_data = user_data;
+		}
+	}
+	return ret;
+}
+
 uint32_t k_clock_event_min_arm_cycles(const struct k_clock_event *event)
 {
 	__ASSERT(event != NULL, "clock event is NULL");
 	__ASSERT(event->backend != NULL, "clock event is not initialized");
 
 	return event->backend->min_arm_cycles(event->context);
+}
+
+uint32_t k_clock_event_now(const struct k_clock_event *event)
+{
+	__ASSERT(event != NULL, "clock event is NULL");
+	__ASSERT(event->backend != NULL, "clock event is not initialized");
+
+	return event->backend->now(event->context);
 }
 
 int k_clock_event_arm_abs(struct k_clock_event *event, uint32_t deadline)

@@ -145,6 +145,15 @@ config CLOCK_EVENT
 	  This is separate from the system-clock timeout API and does not alter
 	  K_TIMEOUT semantics. No provider is selected automatically.
 
+config DEFERRED_RELEASE
+	bool "Deferred deadline-event release"
+	depends on SCHED_DEADLINE
+	select CLOCK_EVENT
+	help
+	  Enable a small helper that uses an absolute clock-event provider to
+	  release a persistent deadline-event consumer no earlier than a requested
+	  cycle. Its start-by deadline remains a separate scheduler ordering key.
+
 config MAIN_STACK_SIZE
 	int "Size of stack for initialization and main thread"
 	default 2048 if COVERAGE_GCOV

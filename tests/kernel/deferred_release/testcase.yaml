@@ -1,0 +1,7 @@
+tests:
+  kernel.deferred_release:
+    tags:
+      - kernel
+      - timer
+    integration_platforms:
+      - native_sim

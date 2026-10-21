@@ -86,8 +86,15 @@ int k_clock_event_init(struct k_clock_event *event,
 		       const struct k_clock_event_backend *backend, void *context,
 		       k_clock_event_handler_t handler, void *user_data);
 
+/** Replace an unarmed event's handler. Returns -EBUSY while armed. */
+int k_clock_event_set_handler(struct k_clock_event *event,
+			    k_clock_event_handler_t handler, void *user_data);
+
 /** Return the provider's minimum reliable absolute-arm lead, in cycles. */
 uint32_t k_clock_event_min_arm_cycles(const struct k_clock_event *event);
+
+/** Return the provider's current cycle count in its absolute-arm domain. */
+uint32_t k_clock_event_now(const struct k_clock_event *event);
 
 /**
  * @brief Arm an absolute event.
