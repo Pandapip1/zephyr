@@ -58,6 +58,19 @@ struct k_thread event_latch_thread;
 K_THREAD_STACK_DEFINE(event_latch_stack, STACK_SIZE);
 volatile int event_latch_runs;
 
+#define EVENT_PRIORITY_THREADS 2
+struct k_deadline_event event_priority_events[EVENT_PRIORITY_THREADS];
+K_SEM_DEFINE(event_priority_armed, 0, EVENT_PRIORITY_THREADS);
+struct k_thread event_priority_threads[EVENT_PRIORITY_THREADS];
+K_THREAD_STACK_ARRAY_DEFINE(event_priority_stacks, EVENT_PRIORITY_THREADS, STACK_SIZE);
+volatile int event_priority_runs;
+int event_priority_order[EVENT_PRIORITY_THREADS];
+
+struct event_priority_post_args {
+	struct k_deadline_event *lower;
+	struct k_deadline_event *higher;
+};
+
 static void event_latch_post_twice(const void *param)
 {
 	struct k_deadline_event *event = (struct k_deadline_event *)param;
@@ -74,6 +87,15 @@ static void event_latch_post_then_reset(const void *param)
 	/* One IRQ transaction proves reset wins before IRQ-exit scheduling. */
 	k_deadline_event_post(event, K_DEADLINE(MSEC_TO_CYCLES(10)));
 	k_deadline_event_reset(event);
+}
+
+static void event_priority_post(const void *param)
+{
+	const struct event_priority_post_args *args = param;
+
+	/* Both releases occur before IRQ-exit scheduling. */
+	k_deadline_event_post(args->lower, K_DEADLINE(MSEC_TO_CYCLES(10)));
+	k_deadline_event_post(args->higher, K_DEADLINE(MSEC_TO_CYCLES(20)));
 }
 
 static void event_latch_worker(void *p1, void *p2, void *p3)
@@ -95,6 +117,22 @@ static void event_latch_worker(void *p1, void *p2, void *p3)
 
 	/* Keep the persistent consumer alive but no longer runnable. */
 	k_deadline_event_wait(&event_latch);
+}
+
+static void event_priority_worker(void *p1, void *p2, void *p3)
+{
+	int index = POINTER_TO_INT(p1);
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	/* Tell the test this persistent consumer is purely suspended in its wait. */
+	k_sem_give(&event_priority_armed);
+	k_deadline_event_wait(&event_priority_events[index]);
+	zassert_true(event_priority_runs < EVENT_PRIORITY_THREADS,
+		     "too many deadline-event consumers ran");
+	event_priority_order[event_priority_runs++] = index;
+	k_thread_suspend(k_current_get());
 }
 
 static void release_worker(void *p1, void *p2, void *p3)
@@ -264,6 +302,53 @@ ZTEST(suite_deadline, test_deadline_event_reset_discards_pending)
 	k_sleep(K_MSEC(1));
 	zassert_equal(event_latch_runs, 0, "reset publication ran");
 	k_thread_abort(&event_latch_thread);
+}
+
+/**
+ * @brief Verify deadline-event releases retain static-priority ordering.
+ *
+ * The lower-priority consumer is released with the earlier start-by deadline,
+ * while the higher-priority consumer gets a later one in the same IRQ
+ * transaction. Static priority wins across priority levels; EDF orders only
+ * consumers with equal static priority. These are run-queue ordering keys,
+ * not release times or a guarantee that either deadline is met.
+ */
+ZTEST(suite_deadline, test_deadline_event_priority_before_deadline)
+{
+	struct event_priority_post_args args = {
+		.lower = &event_priority_events[0],
+		.higher = &event_priority_events[1],
+	};
+
+	event_priority_runs = 0;
+	k_sem_reset(&event_priority_armed);
+	for (int i = 0; i < EVENT_PRIORITY_THREADS; i++) {
+		k_deadline_event_init(&event_priority_events[i]);
+	}
+
+	(void)k_thread_create(&event_priority_threads[0], event_priority_stacks[0],
+			      STACK_SIZE, event_priority_worker, INT_TO_POINTER(0),
+			      NULL, NULL, K_LOWEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
+	(void)k_thread_create(&event_priority_threads[1], event_priority_stacks[1],
+			      STACK_SIZE, event_priority_worker, INT_TO_POINTER(1),
+			      NULL, NULL, K_HIGHEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
+
+	for (int i = 0; i < EVENT_PRIORITY_THREADS; i++) {
+		k_sem_take(&event_priority_armed, K_FOREVER);
+	}
+	irq_offload(event_priority_post, &args);
+	k_sleep(K_MSEC(1));
+
+	zassert_equal(event_priority_runs, EVENT_PRIORITY_THREADS,
+		      "not all deadline-event consumers ran");
+	zassert_equal(event_priority_order[0], 1,
+		      "earlier lower-priority deadline displaced higher priority");
+	zassert_equal(event_priority_order[1], 0,
+		      "lower-priority consumer did not run second");
+
+	for (int i = 0; i < EVENT_PRIORITY_THREADS; i++) {
+		k_thread_abort(&event_priority_threads[i]);
+	}
 }
 
 void worker(void *p1, void *p2, void *p3)
