@@ -20,6 +20,17 @@ config TIMING_FUNCTIONS_NEED_AT_BOOT
 
 DT_CHOSEN_ZEPHYR_TIMING_COUNTER := zephyr,timing-counter
 
+config TIMING_SYS_CLOCK
+	bool "Timing functions backed by the system clock"
+	depends on TIMER_HAS_64BIT_CYCLE_COUNTER
+	depends on !TIMING_COUNTER
+	select TIMING_FUNCTIONS
+	select SOC_HAS_TIMING_FUNCTIONS
+	help
+	  Implement the timing API on k_cycle_get_64(), for system timers whose cycle count is
+	  fine-grained and keeps advancing in every sleep state the system enters, such as
+	  CLOCK_EVENT_SYSTEM_TIMER. The CPU cycle counter stops in sleep; this does not.
+
 config TIMING_COUNTER
 	bool "Timing functions backed by a Counter device"
 	default y if $(dt_chosen_enabled,$(DT_CHOSEN_ZEPHYR_TIMING_COUNTER))
