@@ -20,9 +20,9 @@ extern "C" {
  * @brief Bind one generic clock event to a combined BURTC system-clock device.
  *
  * The combined BURTC driver owns its sole COMP channel and multiplexes this
- * event with the system-clock deadline and the Counter API's one alarm. A
- * device supports one bound clock event. The event must remain valid for the
- * lifetime of the binding.
+ * event with the system-clock deadline and the Counter API's one alarm. The
+ * implementation has a small fixed pool of bound events; each event must
+ * remain valid for the lifetime of its binding.
  */
 int counter_silabs_burtc_clock_event_init(const struct device *dev,
 					  struct k_clock_event *event,

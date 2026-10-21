@@ -31,6 +31,7 @@ LOG_MODULE_REGISTER(counter_silabs_burtc, CONFIG_COUNTER_LOG_LEVEL);
 #define MAX_TIMEOUT_CYC (UINT32_MAX >> 1)
 /* BURTC LFSYNC writes need several LF-clock cycles to take effect. */
 #define MIN_DELAY_CYC 6U
+#define CLOCK_EVENT_CLIENTS 2U
 
 extern unsigned int z_clock_hw_cycles_per_sec;
 #endif
@@ -43,12 +44,25 @@ struct counter_silabs_config {
 	uint32_t prescaler;
 };
 
+#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+struct counter_silabs_clock_event_client {
+	const struct device *dev;
+	uint8_t slot;
+};
+#endif
+
 struct counter_silabs_data {
 #if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
 	counter_alarm_callback_t callback;
 	void *user_data;
 	bool alarm_armed;
 	uint32_t alarm_ticks;
+	/*
+	 * CNT when the alarm was armed. A relative alarm can be more than half a
+	 * 32-bit wrap away, so the alarm is due only once CNT has advanced from
+	 * here by at least (alarm_ticks - alarm_armed_at).
+	 */
+	uint32_t alarm_armed_at;
 #else
 	counter_top_callback_t top_callback;
 	void *top_user_data;
@@ -60,20 +74,17 @@ struct counter_silabs_data {
 	uint32_t max_timeout_ticks;
 	uint32_t system_deadline;
 	bool system_deadline_armed;
-	/*
-	 * A relative Counter alarm can be more than half a 32-bit wrap away.
-	 * Keep track of whether COMP was explicitly programmed for that alarm:
-	 * after the match, CNT can already be numerically past the target, so a
-	 * signed subtraction alone cannot tell it apart from an alarm another
-	 * wrap away.
-	 */
-	bool compare_is_alarm;
+	/* Last COMP value and the CNT at which it was written. */
+	uint32_t compare_value;
+	uint32_t compare_written_at;
 	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
-	/* One generic client shares the single COMP mux with Counter and sysclock. */
-	struct k_clock_event *clock_event;
-	uint32_t clock_event_deadline;
-	uint32_t clock_event_generation;
-	bool clock_event_armed;
+	struct {
+		struct k_clock_event *event;
+		uint32_t deadline;
+		uint32_t generation;
+		bool armed;
+	} clock_event[CLOCK_EVENT_CLIENTS];
+	struct counter_silabs_clock_event_client clock_event_client[CLOCK_EVENT_CLIENTS];
 	#endif
 	bool system_clock_initialized;
 #endif
@@ -96,15 +107,16 @@ static bool deadline_first(uint32_t candidate, uint32_t current, uint32_t now)
 static void counter_silabs_rearm_compare(struct counter_silabs_data *data, uint32_t now)
 {
 	bool armed = false;
-	bool alarm_selected = false;
-	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
-	bool clock_event_selected = false;
-	#endif
+	bool due = false;
 	uint32_t deadline = 0;
 
 	if (data->system_deadline_armed) {
-		deadline = data->system_deadline;
-		armed = true;
+		if (deadline_due(data->system_deadline, now)) {
+			due = true;
+		} else {
+			deadline = data->system_deadline;
+			armed = true;
+		}
 	}
 #if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
 	if (data->alarm_armed) {
@@ -116,53 +128,68 @@ static void counter_silabs_rearm_compare(struct counter_silabs_data *data, uint3
 		 */
 		uint32_t alarm_delta = data->alarm_ticks - now;
 
-		if (alarm_delta < MAX_TIMEOUT_CYC &&
-		    (!armed || deadline_first(data->alarm_ticks, deadline, now))) {
+		if ((now - data->alarm_armed_at) >= (data->alarm_ticks - data->alarm_armed_at)) {
+			due = true;
+		} else if (alarm_delta < MAX_TIMEOUT_CYC &&
+			   (!armed || deadline_first(data->alarm_ticks, deadline, now))) {
 			deadline = data->alarm_ticks;
 			armed = true;
-			alarm_selected = true;
 		}
 	}
 #endif
 	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
-	if (data->clock_event_armed) {
-		uint32_t event_delta = data->clock_event_deadline - now;
-
-		if (event_delta < MAX_TIMEOUT_CYC &&
-		    (!armed || deadline_first(data->clock_event_deadline, deadline, now))) {
-			deadline = data->clock_event_deadline;
+	for (size_t i = 0; i < CLOCK_EVENT_CLIENTS; i++) {
+		if (!data->clock_event[i].armed) {
+			continue;
+		}
+		/* Clock-event deadlines are at most INT32_MAX cycles ahead. */
+		if (deadline_due(data->clock_event[i].deadline, now)) {
+			due = true;
+		} else if (!armed ||
+			   deadline_first(data->clock_event[i].deadline, deadline, now)) {
+			deadline = data->clock_event[i].deadline;
 			armed = true;
-			clock_event_selected = true;
-			alarm_selected = false;
 		}
 	}
 	#endif
 
-	if (armed) {
+	if (due) {
 		/*
-		 * A BURTC LFSYNC write needs several LF-clock cycles.  In
-		 * particular, Counter's EXPIRE_WHEN_LATE path must not set now+1
-		 * and accidentally turn a late callback into a full-wrap wait.
+		 * A client deadline passed without its own COMP match, e.g. because
+		 * COMP was held by a cancelled earlier client.  Rewriting COMP to a
+		 * past value would wait for a 32-bit wrap: pend the IRQ instead and
+		 * let the ISR deliver every due client.
 		 */
+		sl_hal_burtc_set_interrupts(BURTC_IF_COMP);
+		sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
+	} else if (armed) {
 		/*
-		 * An alarm deadline has already been normalized at submission time.
-		 * Do not keep moving it to now + MIN_DELAY_CYC every time the system
-		 * clock re-arms COMP: that can starve a short client alarm forever.
+		 * A BURTC LFSYNC write needs several LF-clock cycles: a compare
+		 * closer than that may be missed and wait for a wrap.  Only the
+		 * programmed COMP is clamped; each client keeps its own deadline
+		 * and is delivered by the ISR once it is due.
 		 */
-		if (!alarm_selected
-		#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
-		    && !clock_event_selected
-		#endif
-		    &&
-		    (deadline_due(deadline, now) ||
-		     (deadline - now) < MIN_DELAY_CYC)) {
+		if ((deadline - now) < MIN_DELAY_CYC) {
+			/*
+			 * Keep an earlier write that already lands in
+			 * [deadline, now + MIN_DELAY_CYC]: rewriting it on every
+			 * re-mux would keep pushing a near deadline back.
+			 */
+			uint32_t prev = data->compare_value;
+
+			if ((prev - data->compare_written_at) >= MIN_DELAY_CYC &&
+			    (prev - now) <= MIN_DELAY_CYC && !deadline_due(prev, now) &&
+			    deadline_first(deadline, prev, now)) {
+				sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
+				return;
+			}
 			deadline = now + MIN_DELAY_CYC;
 		}
-		data->compare_is_alarm = alarm_selected;
+		data->compare_value = deadline;
+		data->compare_written_at = now;
 		sl_hal_burtc_set_compare(deadline);
 		sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
 	} else {
-		data->compare_is_alarm = false;
 		sl_hal_burtc_disable_interrupts(BURTC_IF_COMP);
 	}
 }
@@ -183,7 +210,8 @@ static uint32_t counter_silabs_clock_event_min_arm_cycles(void *context)
 static int counter_silabs_clock_event_arm_abs(void *context, uint32_t deadline,
 					      uint32_t generation)
 {
-	const struct device *dev = context;
+	struct counter_silabs_clock_event_client *client = context;
+	const struct device *dev = client->dev;
 	struct counter_silabs_data *data = dev->data;
 	uint32_t now;
 	k_spinlock_key_t key;
@@ -195,9 +223,9 @@ static int counter_silabs_clock_event_arm_abs(void *context, uint32_t deadline,
 		return -ETIME;
 	}
 
-	data->clock_event_deadline = deadline;
-	data->clock_event_generation = generation;
-	data->clock_event_armed = true;
+	data->clock_event[client->slot].deadline = deadline;
+	data->clock_event[client->slot].generation = generation;
+	data->clock_event[client->slot].armed = true;
 	counter_silabs_rearm_compare(data, now);
 	k_spin_unlock(&data->lock, key);
 	return 0;
@@ -205,12 +233,13 @@ static int counter_silabs_clock_event_arm_abs(void *context, uint32_t deadline,
 
 static void counter_silabs_clock_event_cancel(void *context)
 {
-	const struct device *dev = context;
+	struct counter_silabs_clock_event_client *client = context;
+	const struct device *dev = client->dev;
 	struct counter_silabs_data *data = dev->data;
 	k_spinlock_key_t key;
 
 	key = k_spin_lock(&data->lock);
-	data->clock_event_armed = false;
+	data->clock_event[client->slot].armed = false;
 	counter_silabs_rearm_compare(data, sl_hal_burtc_get_counter());
 	k_spin_unlock(&data->lock, key);
 }
@@ -238,6 +267,7 @@ int counter_silabs_burtc_clock_event_init(const struct device *dev,
 {
 	struct counter_silabs_data *data;
 	k_spinlock_key_t key;
+	uint8_t slot = CLOCK_EVENT_CLIENTS;
 	int ret;
 
 	if (!device_is_ready(dev) || event == NULL) {
@@ -246,21 +276,30 @@ int counter_silabs_burtc_clock_event_init(const struct device *dev,
 
 	data = dev->data;
 	key = k_spin_lock(&data->lock);
-	/* A cancelled client may be rebound by a selector; never replace an arm. */
-	if (data->clock_event != NULL && data->clock_event != event &&
-	    data->clock_event_armed) {
+	for (uint8_t i = 0; i < CLOCK_EVENT_CLIENTS; i++) {
+		if (data->clock_event[i].event == event) {
+			slot = i;
+			break;
+		}
+		if (slot == CLOCK_EVENT_CLIENTS && data->clock_event[i].event == NULL) {
+			slot = i;
+		}
+	}
+	if (slot == CLOCK_EVENT_CLIENTS) {
 		k_spin_unlock(&data->lock, key);
 		return -EBUSY;
 	}
-	data->clock_event = event;
+	data->clock_event[slot].event = event;
+	data->clock_event_client[slot].dev = dev;
+	data->clock_event_client[slot].slot = slot;
 	k_spin_unlock(&data->lock, key);
 
 	ret = k_clock_event_init(event, &counter_silabs_clock_event_backend,
-				 (void *)dev, handler, user_data);
+			 &data->clock_event_client[slot], handler, user_data);
 	if (ret != 0) {
 		key = k_spin_lock(&data->lock);
-		if (data->clock_event == event) {
-			data->clock_event = NULL;
+		if (data->clock_event[slot].event == event) {
+			data->clock_event[slot].event = NULL;
 		}
 		k_spin_unlock(&data->lock, key);
 	}
@@ -430,6 +469,7 @@ static int counter_silabs_set_alarm(const struct device *dev, uint8_t chan_id,
 	dev_data->callback = alarm_cfg->callback;
 	dev_data->user_data = alarm_cfg->user_data;
 	dev_data->alarm_ticks = alarm_ticks;
+	dev_data->alarm_armed_at = now;
 	dev_data->alarm_armed = true;
 
 #if defined(CONFIG_GECKO_BURTC_TIMER)
@@ -646,8 +686,8 @@ void counter_silabs_isr_handler(const struct device *dev)
 	uint32_t unannounced;
 #endif
 	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
-	struct k_clock_event *clock_event = NULL;
-	uint32_t clock_event_generation = 0U;
+	struct k_clock_event *clock_event[CLOCK_EVENT_CLIENTS] = { 0 };
+	uint32_t clock_event_generation[CLOCK_EVENT_CLIENTS] = { 0 };
 	#endif
 
 	sl_hal_burtc_clear_interrupts(flags);
@@ -663,11 +703,14 @@ void counter_silabs_isr_handler(const struct device *dev)
 #if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
 	alarm_callback = NULL;
 	alarm_user_data = NULL;
-	if (burtc_data->alarm_armed
-#if defined(CONFIG_GECKO_BURTC_TIMER)
-	    && burtc_data->compare_is_alarm
-#endif
-	) {
+	/*
+	 * A latched COMP flag says only that some client's compare matched; it
+	 * can belong to a deadline that was cancelled or replaced while the IRQ
+	 * was pending. Deliver the alarm only once CNT has reached it.
+	 */
+	if (burtc_data->alarm_armed &&
+	    (now - burtc_data->alarm_armed_at) >=
+		    (burtc_data->alarm_ticks - burtc_data->alarm_armed_at)) {
 		alarm_callback = burtc_data->callback;
 		alarm_user_data = burtc_data->user_data;
 		burtc_data->callback = NULL;
@@ -677,12 +720,13 @@ void counter_silabs_isr_handler(const struct device *dev)
 #endif
 #if defined(CONFIG_GECKO_BURTC_TIMER)
 	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
-	/* The generic event deadline is within its half-wrap validity window. */
-	if (burtc_data->clock_event_armed &&
-	    deadline_due(burtc_data->clock_event_deadline, now)) {
-		clock_event = burtc_data->clock_event;
-		clock_event_generation = burtc_data->clock_event_generation;
-		burtc_data->clock_event_armed = false;
+	for (size_t i = 0; i < CLOCK_EVENT_CLIENTS; i++) {
+		if (burtc_data->clock_event[i].armed &&
+		    deadline_due(burtc_data->clock_event[i].deadline, now)) {
+			clock_event[i] = burtc_data->clock_event[i].event;
+			clock_event_generation[i] = burtc_data->clock_event[i].generation;
+			burtc_data->clock_event[i].armed = false;
+		}
 	}
 	#endif
 	prev = atomic_get(&burtc_data->last_count);
@@ -710,9 +754,10 @@ void counter_silabs_isr_handler(const struct device *dev)
 	sys_clock_announce(unannounced);
 #endif
 	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
-	if (clock_event != NULL) {
-		/* Do not take the generic event lock while holding the BURTC mux lock. */
-		k_clock_event_fire(clock_event, clock_event_generation);
+	for (size_t i = 0; i < CLOCK_EVENT_CLIENTS; i++) {
+		if (clock_event[i] != NULL) {
+			k_clock_event_fire(clock_event[i], clock_event_generation[i]);
+		}
 	}
 	#endif
 #if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
