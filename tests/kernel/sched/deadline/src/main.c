@@ -31,6 +31,49 @@ int thread_deadlines[NUM_THREADS];
 int n_exec;
 int exec_order[NUM_THREADS];
 
+struct k_thread release_thread;
+K_THREAD_STACK_DEFINE(release_stack, STACK_SIZE);
+volatile int release_runs;
+
+static void release_worker(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	release_runs++;
+	k_thread_suspend(k_current_get());
+}
+
+/**
+ * @brief Verify atomic deadline assignment and release of a persistent thread.
+ *
+ * A suspended thread is made eligible with a deadline and runs exactly once.
+ * A second release fails rather than changing the state of an already-ready
+ * thread, which also keeps timeout and object-wait release semantics outside
+ * this API.
+ */
+ZTEST(suite_deadline, test_release_with_deadline)
+{
+	k_tid_t tid;
+
+	release_runs = 0;
+	tid = k_thread_create(&release_thread, release_stack, STACK_SIZE,
+			      release_worker, NULL, NULL, NULL,
+			      K_LOWEST_APPLICATION_THREAD_PRIO, K_SUSPENDED,
+			      K_NO_WAIT);
+
+	zassert_equal(k_thread_release_with_deadline(tid,
+					     K_DEADLINE(MSEC_TO_CYCLES(10))), 0,
+		      "suspended thread was not released");
+	zassert_equal(k_thread_release_with_deadline(tid,
+					     K_DEADLINE(MSEC_TO_CYCLES(10))), -EALREADY,
+		      "already-ready thread was released");
+	k_sleep(K_MSEC(10));
+	zassert_equal(release_runs, 1, "released thread did not run once");
+	k_thread_abort(tid);
+}
+
 void worker(void *p1, void *p2, void *p3)
 {
 	int tidx = POINTER_TO_INT(p1);

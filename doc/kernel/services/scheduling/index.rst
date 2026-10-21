@@ -50,6 +50,15 @@ enabled, two threads are only considered to have the same priority when both
 their static priorities and deadlines are equal. The routine
 :c:func:`k_thread_deadline_set` is used to set a thread's deadline.
 
+For persistent event-handling threads, :c:func:`k_thread_release_with_deadline`
+atomically changes a suspended thread to ready while assigning its deadline.
+This is an explicit eligible-now transition: it does not wake a thread that is
+sleeping or pending on an object, so it does not change the not-before
+semantics of :c:type:`k_timeout_t`.  The :c:macro:`K_DEADLINE` helper constructs
+the absolute scheduler deadline from a relative cycle count.  As with the
+other deadline APIs, this deadline orders ready equal-priority threads only;
+it is not a start-time or completion-time guarantee.
+
 .. note::
     Execution of ISRs takes precedence over thread execution,
     so the execution of the current thread may be replaced by an ISR

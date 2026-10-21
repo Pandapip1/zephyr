@@ -24,6 +24,7 @@
 #include <zephyr/sys/math_extras.h>
 #include <zephyr/sys/minmax.h>
 #include <zephyr/logging/log.h>
+#include <errno.h>
 
 /**
  * @brief Atomically update a thread's prio_deadline in the run queue.
@@ -79,6 +80,33 @@ void z_impl_k_thread_deadline_set(k_tid_t tid, int deadline)
 	z_impl_k_thread_absolute_deadline_set(tid, (int)newdl);
 }
 
+int z_impl_k_thread_release_with_deadline(k_tid_t tid, int deadline)
+{
+	struct k_thread *thread = tid;
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	/*
+	 * Suspension is the explicit persistent-job idle state.  Do not turn this
+	 * API into a timeout wakeup: sleepers and object waiters retain their
+	 * K_TIMEOUT release semantics.
+	 */
+	if (unlikely(!z_is_thread_suspended(thread))) {
+		z_sched_spinlock_unlock(key);
+		return -EALREADY;
+	}
+
+	/* The thread is not queued while suspended, so set the ordering key before
+	 * adding it to the ready queue.  This prevents an intermediate, stale
+	 * deadline from being observable by the scheduler.
+	 */
+	thread->base.prio_deadline = deadline;
+	z_mark_thread_as_not_suspended(thread);
+	z_sched_ready_locked(thread);
+	z_reschedule_locked(key);
+
+	return 0;
+}
+
 #ifdef CONFIG_USERSPACE
 static inline void z_vrfy_k_thread_absolute_deadline_set(k_tid_t tid, int deadline)
 {
@@ -102,4 +130,15 @@ static inline void z_vrfy_k_thread_deadline_set(k_tid_t tid, int deadline)
 	z_impl_k_thread_deadline_set((k_tid_t)thread, deadline);
 }
 #include <zephyr/syscalls/k_thread_deadline_set_mrsh.c>
+
+static inline int z_vrfy_k_thread_release_with_deadline(k_tid_t tid,
+						 int deadline)
+{
+	struct k_thread *thread = tid;
+
+	K_OOPS(K_SYSCALL_OBJ(thread, K_OBJ_THREAD));
+
+	return z_impl_k_thread_release_with_deadline((k_tid_t)thread, deadline);
+}
+#include <zephyr/syscalls/k_thread_release_with_deadline_mrsh.c>
 #endif /* CONFIG_USERSPACE */

@@ -1111,6 +1111,21 @@ __syscall void k_thread_priority_set(k_tid_t thread, int prio);
 
 #ifdef CONFIG_SCHED_DEADLINE
 /**
+ * @brief Construct an absolute scheduler deadline from a relative cycle count.
+ *
+ * A deadline is a latest preferred scheduling point, distinct from a
+ * @ref k_timeout_t, which expresses a not-before release or wait bound.
+ * This macro captures the current cycle counter and produces the absolute
+ * timestamp consumed by @ref k_thread_release_with_deadline.
+ *
+ * @note A scheduler deadline orders only ready threads of equal static
+ * priority. It is not an admission-control or completion-time guarantee.
+ *
+ * @param cycles Relative deadline in hardware-cycle units.
+ */
+#define K_DEADLINE(cycles) ((int)(k_cycle_get_32() + (uint32_t)(cycles)))
+
+/**
  * @brief Set relative deadline expiration time for scheduler
  *
  * This sets the "deadline" expiration as a time delta from the
@@ -1188,6 +1203,31 @@ __syscall void k_thread_deadline_set(k_tid_t thread, int deadline);
  * @param deadline A timestamp, in cycle units
  */
 __syscall void k_thread_absolute_deadline_set(k_tid_t thread, int deadline);
+
+/**
+ * @brief Make a suspended persistent thread eligible with a deadline.
+ *
+ * This atomically assigns @p deadline and moves a suspended thread to the
+ * ready queue. It is intended for persistent threads which suspend
+ * themselves while idle and are explicitly released by an event source.
+ * In particular, it does not cancel or shorten a @ref k_timeout_t: a sleeping
+ * or pended thread is not released by this API.
+ *
+ * If called from an ISR, normal interrupt-exit scheduling selects the next
+ * thread; this API never invokes a thread inline from the ISR.
+ *
+ * @note @p deadline affects ordering only among ready threads with the same
+ * static priority. It is a latest preferred start point, not a guarantee that
+ * the thread will start or complete by that time.
+ *
+ * @param thread Suspended thread to release.
+ * @param deadline Absolute timestamp in @ref k_cycle_get_32 units. Use
+ *                 @ref K_DEADLINE for a deadline relative to the call site.
+ *
+ * @retval 0 The thread transitioned from suspended to ready.
+ * @retval -EALREADY The thread was not suspended.
+ */
+__syscall int k_thread_release_with_deadline(k_tid_t thread, int deadline);
 #endif
 
 /**
