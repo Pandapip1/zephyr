@@ -1113,7 +1113,7 @@ __syscall void k_thread_priority_set(k_tid_t thread, int prio);
 /**
  * @brief Construct an absolute scheduler deadline from a relative cycle count.
  *
- * A deadline is a latest preferred scheduling point, distinct from a
+ * A deadline is a latest desired start-by scheduling point, distinct from a
  * @ref k_timeout_t, which expresses a not-before release or wait bound.
  * This macro captures the current cycle counter and produces the absolute
  * timestamp consumed by @ref k_thread_release_with_deadline.
@@ -1217,7 +1217,7 @@ __syscall void k_thread_absolute_deadline_set(k_tid_t thread, int deadline);
  * thread; this API never invokes a thread inline from the ISR.
  *
  * @note @p deadline affects ordering only among ready threads with the same
- * static priority. It is a latest preferred start point, not a guarantee that
+ * static priority. It is a latest desired start-by point, not a guarantee that
  * the thread will start or complete by that time.
  *
  * @param thread Suspended thread to release.

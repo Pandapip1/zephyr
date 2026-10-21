@@ -56,8 +56,9 @@ This is an explicit eligible-now transition: it does not wake a thread that is
 sleeping or pending on an object, so it does not change the not-before
 semantics of :c:type:`k_timeout_t`.  The :c:macro:`K_DEADLINE` helper constructs
 the absolute scheduler deadline from a relative cycle count.  As with the
-other deadline APIs, this deadline orders ready equal-priority threads only;
-it is not a start-time or completion-time guarantee.
+other deadline APIs, this deadline is a desired start-by point that orders
+ready equal-priority threads only; it is not a start-time or completion-time
+guarantee.
 
 .. note::
     Execution of ISRs takes precedence over thread execution,

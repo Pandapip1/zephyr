@@ -35,6 +35,20 @@ struct k_thread release_thread;
 K_THREAD_STACK_DEFINE(release_stack, STACK_SIZE);
 volatile int release_runs;
 
+#define RELEASE_ORDER_THREADS 2
+struct k_thread release_order_threads[RELEASE_ORDER_THREADS];
+K_THREAD_STACK_ARRAY_DEFINE(release_order_stacks, RELEASE_ORDER_THREADS,
+				    STACK_SIZE);
+volatile int release_order_runs;
+int release_order[RELEASE_ORDER_THREADS];
+
+struct release_order_args {
+	k_tid_t later;
+	k_tid_t earlier;
+	int later_deadline;
+	int earlier_deadline;
+};
+
 static void release_worker(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -43,6 +57,32 @@ static void release_worker(void *p1, void *p2, void *p3)
 
 	release_runs++;
 	k_thread_suspend(k_current_get());
+}
+
+static void release_order_worker(void *p1, void *p2, void *p3)
+{
+	int index = POINTER_TO_INT(p1);
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	zassert_true(release_order_runs < RELEASE_ORDER_THREADS,
+		     "too many released workers ran");
+	release_order[release_order_runs++] = index;
+	k_thread_suspend(k_current_get());
+}
+
+static void release_order_offload(const void *param)
+{
+	const struct release_order_args *args = param;
+
+	/* Both transitions occur before interrupt-exit scheduling. */
+	zassert_equal(k_thread_release_with_deadline(args->later,
+					     args->later_deadline), 0,
+		      "later-deadline thread was not released");
+	zassert_equal(k_thread_release_with_deadline(args->earlier,
+					     args->earlier_deadline), 0,
+		      "earlier-deadline thread was not released");
 }
 
 /**
@@ -72,6 +112,48 @@ ZTEST(suite_deadline, test_release_with_deadline)
 	k_sleep(K_MSEC(10));
 	zassert_equal(release_runs, 1, "released thread did not run once");
 	k_thread_abort(tid);
+}
+
+/**
+ * @brief Verify IRQ-released persistent threads retain EDF ordering.
+ *
+ * Two same-priority suspended threads are released during one IRQ-offload
+ * invocation.  The release API only makes them ready; on IRQ exit the normal
+ * scheduler must select the thread with the earlier absolute deadline first.
+ */
+ZTEST(suite_deadline, test_release_with_deadline_order)
+{
+	struct release_order_args args;
+
+	release_order_runs = 0;
+	args.later = k_thread_create(&release_order_threads[0],
+				     release_order_stacks[0], STACK_SIZE,
+				     release_order_worker, INT_TO_POINTER(0), NULL, NULL,
+				     K_LOWEST_APPLICATION_THREAD_PRIO, K_SUSPENDED,
+				     K_NO_WAIT);
+	args.earlier = k_thread_create(&release_order_threads[1],
+				       release_order_stacks[1], STACK_SIZE,
+				       release_order_worker, INT_TO_POINTER(1), NULL, NULL,
+				       K_LOWEST_APPLICATION_THREAD_PRIO, K_SUSPENDED,
+				       K_NO_WAIT);
+
+	/* K_DEADLINE produces absolute, distinct EDF ordering keys. */
+	args.later_deadline = K_DEADLINE(MSEC_TO_CYCLES(20));
+	args.earlier_deadline = K_DEADLINE(MSEC_TO_CYCLES(10));
+
+	irq_offload(release_order_offload, &args);
+	k_sleep(K_MSEC(10));
+
+	zassert_equal(release_order_runs, RELEASE_ORDER_THREADS,
+		      "not all released workers ran");
+	zassert_equal(release_order[0], 1,
+		      "later deadline ran before earlier deadline");
+	zassert_equal(release_order[1], 0,
+		      "later deadline did not run second");
+
+	for (int i = 0; i < RELEASE_ORDER_THREADS; i++) {
+		k_thread_abort(&release_order_threads[i]);
+	}
 }
 
 void worker(void *p1, void *p2, void *p3)
