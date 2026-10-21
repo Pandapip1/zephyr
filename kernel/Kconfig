@@ -137,6 +137,14 @@ config SCHED_DEADLINE
 	  single priority will choose the next expiring deadline and
 	  not simply the least recently added thread.
 
+config CLOCK_EVENT
+	bool "Optional absolute clock-event interface"
+	help
+	  Enable the generic interface for an optional hardware provider that can
+	  arm one absolute-cycle callback and report its minimum reliable arm lead.
+	  This is separate from the system-clock timeout API and does not alter
+	  K_TIMEOUT semantics. No provider is selected automatically.
+
 config MAIN_STACK_SIZE
 	int "Size of stack for initialization and main thread"
 	default 2048 if COVERAGE_GCOV

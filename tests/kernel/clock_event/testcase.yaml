@@ -1,0 +1,7 @@
+tests:
+  kernel.clock_event:
+    tags:
+      - kernel
+      - timer
+    integration_platforms:
+      - native_sim
