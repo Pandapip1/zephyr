@@ -91,6 +91,7 @@ static int counter_silabs_set_alarm(const struct device *dev, uint8_t chan_id,
 {
 	struct counter_silabs_data *const dev_data = dev->data;
 	uint32_t alarm_ticks = alarm_cfg->ticks;
+	uint32_t now;
 
 	/* BURTC has only one channel */
 	if (chan_id != 0) {
@@ -104,6 +105,20 @@ static int counter_silabs_set_alarm(const struct device *dev, uint8_t chan_id,
 
 	if (!(alarm_cfg->flags & COUNTER_ALARM_CFG_ABSOLUTE)) {
 		alarm_ticks += sl_hal_burtc_get_counter();
+	} else {
+		now = sl_hal_burtc_get_counter();
+		/*
+		 * BURTC compares are one-shot absolute matches.  A compare value
+		 * already behind CNT would otherwise wait for the 32-bit wrap,
+		 * even though the counter API explicitly requests late expiry.
+		 */
+		if ((int32_t)(alarm_ticks - now) <= 0) {
+			if (!(alarm_cfg->flags & COUNTER_ALARM_CFG_EXPIRE_WHEN_LATE)) {
+				return -ETIME;
+			}
+			/* Program the next tick so callback delivery remains IRQ-owned. */
+			alarm_ticks = now + 1U;
+		}
 	}
 
 	sl_hal_burtc_clear_interrupts(BURTC_IF_COMP);
