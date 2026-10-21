@@ -120,8 +120,14 @@ static void counter_silabs_rearm_compare(struct counter_silabs_data *data, uint3
 		 * particular, Counter's EXPIRE_WHEN_LATE path must not set now+1
 		 * and accidentally turn a late callback into a full-wrap wait.
 		 */
-		if ((!alarm_selected && deadline_due(deadline, now)) ||
-		    (deadline - now) < MIN_DELAY_CYC) {
+		/*
+		 * An alarm deadline has already been normalized at submission time.
+		 * Do not keep moving it to now + MIN_DELAY_CYC every time the system
+		 * clock re-arms COMP: that can starve a short client alarm forever.
+		 */
+		if (!alarm_selected &&
+		    (deadline_due(deadline, now) ||
+		     (deadline - now) < MIN_DELAY_CYC)) {
 			deadline = now + MIN_DELAY_CYC;
 		}
 		data->compare_is_alarm = alarm_selected;
@@ -279,9 +285,17 @@ static int counter_silabs_set_alarm(const struct device *dev, uint8_t chan_id,
 				k_spin_unlock(&dev_data->lock, key);
 				return -ETIME;
 			}
-			/* Program the next tick so callback delivery remains IRQ-owned. */
-			alarm_ticks = now + 1U;
+			/*
+			 * Program the earliest deadline the LFSYNC path can honor. The
+			 * shared system-clock re-arm must retain this normalized value;
+			 * otherwise repeated now + MIN_DELAY_CYC rewrites can starve it.
+			 */
+			alarm_ticks = now + MIN_DELAY_CYC;
 		}
+	}
+	if ((alarm_ticks - now) < MIN_DELAY_CYC) {
+		/* A future deadline can also be too close for a synchronized write. */
+		alarm_ticks = now + MIN_DELAY_CYC;
 	}
 
 	dev_data->callback = alarm_cfg->callback;
