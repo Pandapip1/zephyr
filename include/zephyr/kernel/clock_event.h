@@ -47,6 +47,15 @@ typedef void (*k_clock_event_handler_t)(struct k_clock_event *event, void *user_
  * arm_abs().
  */
 struct k_clock_event_backend {
+	/**
+	 * Optionally bind an event to provider-specific delivery state.
+	 *
+	 * Providers whose interrupt mux needs to retain the event pointer use this
+	 * hook. Providers without such state leave it NULL and the generic layer
+	 * initializes the event directly.
+	 */
+	int (*event_init)(void *context, struct k_clock_event *event,
+			  k_clock_event_handler_t handler, void *user_data);
 	/** Read the current cycle count in the provider's cycle domain. */
 	uint32_t (*now)(void *context);
 	/** Return the minimum reliable lead time for an absolute arm. */

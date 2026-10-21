@@ -215,7 +215,16 @@ static void counter_silabs_clock_event_cancel(void *context)
 	k_spin_unlock(&data->lock, key);
 }
 
+static int counter_silabs_clock_event_event_init(void *context,
+						 struct k_clock_event *event,
+						 k_clock_event_handler_t handler,
+						 void *user_data)
+{
+	return counter_silabs_burtc_clock_event_init(context, event, handler, user_data);
+}
+
 static const struct k_clock_event_backend counter_silabs_clock_event_backend = {
+	.event_init = counter_silabs_clock_event_event_init,
 	.now = counter_silabs_clock_event_now,
 	.min_arm_cycles = counter_silabs_clock_event_min_arm_cycles,
 	.arm_abs = counter_silabs_clock_event_arm_abs,
@@ -237,7 +246,9 @@ int counter_silabs_burtc_clock_event_init(const struct device *dev,
 
 	data = dev->data;
 	key = k_spin_lock(&data->lock);
-	if (data->clock_event != NULL && data->clock_event != event) {
+	/* A cancelled client may be rebound by a selector; never replace an arm. */
+	if (data->clock_event != NULL && data->clock_event != event &&
+	    data->clock_event_armed) {
 		k_spin_unlock(&data->lock, key);
 		return -EBUSY;
 	}

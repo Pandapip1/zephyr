@@ -72,6 +72,62 @@ int k_deferred_release_post(struct k_deferred_release *release,
 	return ret;
 }
 
+int k_deferred_release_post_selected(struct k_deferred_release *release,
+				     struct k_clock_event *clock_event,
+				     uint32_t not_before, int deadline,
+				     uint32_t required_power_states,
+				     uint32_t max_min_arm_cycles)
+{
+	const struct k_clock_event_provider *provider;
+	struct k_deadline_event *event = NULL;
+	uint32_t now;
+	int ret = 0;
+
+	if (release == NULL || release->event == NULL || clock_event == NULL) {
+		return -EINVAL;
+	}
+
+	provider = k_clock_event_provider_select(required_power_states,
+					  max_min_arm_cycles);
+	if (provider == NULL) {
+		return -ENODEV;
+	}
+
+	K_SPINLOCK(&release->lock) {
+		/* A selected post replaces any pending deferred publication. */
+		if (release->clock_event != NULL) {
+			k_clock_event_cancel(release->clock_event);
+		}
+		release->armed = false;
+		if (provider->backend->event_init != NULL) {
+			ret = provider->backend->event_init(provider->context, clock_event,
+						    deferred_release_fire, release);
+		} else {
+			ret = k_clock_event_init(clock_event, provider->backend, provider->context,
+						 deferred_release_fire, release);
+		}
+		if (ret != 0) {
+			break;
+		}
+		release->clock_event = clock_event;
+		now = k_clock_event_now(clock_event);
+		if ((int32_t)(not_before - now) <= 0) {
+			event = release->event;
+		} else {
+			release->deadline = deadline;
+			release->armed = true;
+			ret = k_clock_event_arm_abs(clock_event, not_before);
+			if (ret != 0) {
+				release->armed = false;
+			}
+		}
+	}
+	if (event != NULL) {
+		k_deadline_event_post(event, deadline);
+	}
+	return ret;
+}
+
 void k_deferred_release_cancel(struct k_deferred_release *release)
 {
 	__ASSERT(release != NULL, "deferred release is NULL");

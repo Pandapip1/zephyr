@@ -49,6 +49,29 @@ int k_deferred_release_init(struct k_deferred_release *release,
 int k_deferred_release_post(struct k_deferred_release *release,
 			    uint32_t not_before, int deadline);
 
+/**
+ * @brief Select a clock-event provider and publish @p event no earlier than
+ *        @p not_before.
+ *
+ * The selected provider must satisfy @p required_power_states and have a
+ * minimum arm lead no greater than @p max_min_arm_cycles. @p clock_event is
+ * caller-owned storage used for the selected provider; this call replaces any
+ * prior unreleased publication on @p release. It returns -ENODEV when no
+ * registered provider meets those requirements.
+ *
+ * @p deadline is a @ref K_DEADLINE start-by key for the released consumer; it
+ * is not a release time. @p not_before is the release time and remains in the
+ * selected provider's cycle domain. Because @ref K_DEADLINE is expressed in
+ * @ref k_cycle_get_32 units, selection is valid only among providers whose
+ * cycle domain matches @ref k_cycle_get_32 when their timestamps are compared.
+ * This helper does not impose a power-management policy.
+ */
+int k_deferred_release_post_selected(struct k_deferred_release *release,
+				     struct k_clock_event *clock_event,
+				     uint32_t not_before, int deadline,
+				     uint32_t required_power_states,
+				     uint32_t max_min_arm_cycles);
+
 /** Cancel an unreleased deferred publication. Already-published work remains. */
 void k_deferred_release_cancel(struct k_deferred_release *release);
 

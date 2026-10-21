@@ -48,6 +48,12 @@ static const struct k_clock_event_backend fake_backend = {
 K_DEADLINE_EVENT_DEFINE(event);
 K_DEFERRED_RELEASE_DEFINE(release);
 K_CLOCK_EVENT_DEFINE(clock_event);
+K_CLOCK_EVENT_DEFINE(selected_clock_event);
+
+static struct fake_provider selected_provider = {
+	.now = 100U,
+	.min_lead = 3U,
+};
 
 static void unused_clock_event_handler(struct k_clock_event *event, void *user_data)
 {
@@ -98,6 +104,25 @@ ZTEST(deferred_release, test_too_late_future_release_is_not_posted_early)
 		      "inside-lead release was accepted");
 	zassert_equal(provider.arms, 0U, "too-late release reached provider");
 	zassert_false(event.pending, "too-late release posted early");
+}
+
+ZTEST(deferred_release, test_selected_provider_arms_deferred_release)
+{
+	struct fake_provider provider;
+
+	reset(&provider);
+	selected_provider = (struct fake_provider) { .now = 100U, .min_lead = 3U };
+	zassert_equal(k_clock_event_provider_register(&fake_backend, &selected_provider,
+					      K_CLOCK_EVENT_POWER_DEEP_SLEEP), 0,
+		      "provider registration failed");
+	zassert_equal(k_deferred_release_post_selected(&release, &selected_clock_event,
+					       110U, K_DEADLINE(222U),
+					       K_CLOCK_EVENT_POWER_DEEP_SLEEP, 3U), 0,
+		      "selected release arm failed");
+	zassert_equal(selected_provider.arms, 1U, "selected provider was not armed");
+	zassert_false(event.pending, "selected release posted early");
+	k_clock_event_fire(&selected_clock_event, selected_provider.generation);
+	zassert_true(event.pending, "selected provider expiry did not release event");
 }
 
 ZTEST_SUITE(deferred_release, NULL, NULL, NULL, NULL, NULL);
