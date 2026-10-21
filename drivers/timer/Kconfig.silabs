@@ -15,3 +15,32 @@ config SILABS_SLEEPTIMER_TIMER
 	help
 	  This module implements a kernel device driver for the sleeptimer
 	  and provides the standard "system clock driver" interfaces.
+
+config SILABS_BURTC_CLOCK_EVENT
+	bool "Silabs BURTC deep-sleep clock-event provider"
+	depends on SOC_FAMILY_SILABS_S2
+	depends on DT_HAS_SILABS_BURTC_COUNTER_ENABLED
+	depends on !COUNTER_SILABS_BURTC
+	select CLOCK_EVENT
+	select SILABS_SISDK_BURTC
+	help
+	  Own the BURTC and register it as a clock-event provider that keeps
+	  running in deep sleep. Its single COMP is shared by a fixed set of
+	  events. Use it with CLOCK_EVENT_SYSTEM_TIMER; the BURTC Counter driver
+	  must be disabled.
+
+if SILABS_BURTC_CLOCK_EVENT
+
+config SILABS_BURTC_CLOCK_EVENT_SLOTS
+	int "BURTC clock-event slots"
+	default 1 if CLOCK_EVENT_SCHED
+	default 2
+	range 1 32
+
+config SILABS_BURTC_CLOCK_EVENT_INIT_PRIORITY
+	int "BURTC clock-event provider init priority"
+	default 40
+	help
+	  PRE_KERNEL_1 priority; must follow the clock controller.
+
+endif # SILABS_BURTC_CLOCK_EVENT

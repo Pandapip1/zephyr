@@ -91,3 +91,22 @@ config COUNTER_SILABS_TIMER
 	  TIMER peripheral.
 	  This driver supports counter mode with compare-match alarms
 	  using TIMER on Silicon Labs Series 2 SoCs.
+
+config COUNTER_SILABS_TIMER_CLOCK_EVENT
+	bool "TIMER absolute clock-event provider"
+	depends on COUNTER_SILABS_TIMER
+	select CLOCK_EVENT
+	help
+	  Register every enabled 32-bit TIMER as an active-only clock-event
+	  provider. Each bound event owns one CC channel in output-compare mode,
+	  allocated from the highest channel down; the Counter alarm API cannot
+	  use a channel while an event owns it. The counter is started at init.
+
+config COUNTER_SILABS_TIMER_CLOCK_EVENT_MIN_LEAD_NS
+	int "TIMER clock-event minimum arm lead (ns)"
+	depends on COUNTER_SILABS_TIMER_CLOCK_EVENT
+	default 2000
+	help
+	  Shortest lead accepted for an absolute arm. It covers the CPU time from
+	  the lead check to the compare write; a compare that is passed anyway is
+	  delivered at once rather than after a counter wrap.

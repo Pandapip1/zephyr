@@ -19,6 +19,10 @@
 
 #include <sl_hal_timer.h>
 
+#if defined(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT)
+#include <zephyr/kernel/clock_event.h>
+#endif
+
 LOG_MODULE_REGISTER(silabs_timer_counter, CONFIG_COUNTER_LOG_LEVEL);
 
 #define DT_DRV_COMPAT silabs_timer_counter
@@ -32,9 +36,27 @@ struct counter_silabs_timer_config {
 	TIMER_TypeDef *timer; /* Reference pointer to counter device */
 };
 
+#if defined(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT)
+/* One clock event per CC channel; the provider context uses chan = UINT8_MAX. */
+struct counter_silabs_timer_clock_event {
+	const struct device *dev;
+	struct k_clock_event *event;
+	uint32_t deadline;
+	uint32_t generation;
+	uint8_t chan;
+	bool armed;
+};
+#endif
+
 struct counter_silabs_timer_data {
 	struct counter_top_cfg top;
 	struct counter_alarm_cfg *alarms;
+#if defined(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT)
+	struct counter_silabs_timer_clock_event *clock_events;
+	struct counter_silabs_timer_clock_event provider;
+	uint32_t ce_frequency;
+	uint32_t ce_min_lead;
+#endif
 };
 
 /* Helper func */
@@ -191,6 +213,11 @@ static int counter_silabs_timer_set_alarm(const struct device *dev, uint8_t chan
 	if (alarm_cfg->ticks > top_val) {
 		return -EINVAL;
 	}
+#if defined(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT)
+	if (data->clock_events[chan_id].event != NULL) {
+		return -EBUSY; /* channel owned by a clock event */
+	}
+#endif
 	/* Cancel current channel alarm */
 	counter_silabs_timer_cancel_alarm(dev, chan_id);
 
@@ -239,12 +266,184 @@ static uint32_t counter_silabs_timer_get_freq(const struct device *dev)
 	return freq_hz / config->clock_div;
 }
 
+#if defined(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT)
+/*
+ * Clock-event provider on a 32-bit TIMER: each bound event owns one CC
+ * channel in output-compare mode. The TIMER clock stops below EM1, so the
+ * provider registers as active-only.
+ */
+static uint32_t counter_silabs_timer_ce_now(void *context)
+{
+	const struct counter_silabs_timer_clock_event *ce = context;
+	const struct counter_silabs_timer_config *config = ce->dev->config;
+
+	return sl_hal_timer_get_counter(config->timer);
+}
+
+/*
+ * The rate and minimum lead are fixed once the provider registers; both are on the arm path,
+ * where a clock-tree query would cost more than the lead itself.
+ */
+static uint32_t counter_silabs_timer_ce_frequency_hz(void *context)
+{
+	const struct counter_silabs_timer_clock_event *ce = context;
+	const struct counter_silabs_timer_data *data = ce->dev->data;
+
+	return data->ce_frequency;
+}
+
+static uint32_t counter_silabs_timer_ce_min_arm_cycles(void *context)
+{
+	const struct counter_silabs_timer_clock_event *ce = context;
+	const struct counter_silabs_timer_data *data = ce->dev->data;
+
+	return data->ce_min_lead;
+}
+
+static int counter_silabs_timer_ce_arm_abs(void *context, uint32_t deadline,
+					   uint32_t generation)
+{
+	struct counter_silabs_timer_clock_event *ce = context;
+	const struct counter_silabs_timer_config *config = ce->dev->config;
+	const struct counter_silabs_timer_data *data = ce->dev->data;
+	uint32_t flag = get_IF_flag(ce->chan);
+	unsigned int key = irq_lock();
+	uint32_t now = sl_hal_timer_get_counter(config->timer);
+	uint32_t compare = deadline;
+
+	/*
+	 * The generic layer already refused a deadline inside the minimum lead.
+	 * If the counter has moved on since its check, clamp only the programmed
+	 * compare: the event is delivered at most one minimum lead late, never
+	 * early, and the deadline itself still decides due-ness in the ISR.
+	 */
+	if ((int32_t)(deadline - now) < (int32_t)data->ce_min_lead) {
+		compare = now + data->ce_min_lead;
+	}
+	sl_hal_timer_disable_interrupts(config->timer, flag);
+	sl_hal_timer_clear_interrupts(config->timer, flag);
+	sl_hal_timer_channel_set_compare(config->timer, ce->chan, compare);
+	ce->deadline = deadline;
+	ce->generation = generation;
+	ce->armed = true;
+	sl_hal_timer_enable_interrupts(config->timer, flag);
+	/*
+	 * A compare written after CNT already passed it would wait for a wrap.
+	 * The lead check makes that unlikely; if it happened anyway, the deadline
+	 * has passed, so pend the flag rather than lose the event.
+	 */
+	now = sl_hal_timer_get_counter(config->timer);
+	if ((int32_t)(deadline - now) <= 0 &&
+	    (sl_hal_timer_get_pending_interrupts(config->timer) & flag) == 0U) {
+		sl_hal_timer_set_interrupts(config->timer, flag);
+	}
+	irq_unlock(key);
+	return 0;
+}
+
+static void counter_silabs_timer_ce_cancel(void *context)
+{
+	struct counter_silabs_timer_clock_event *ce = context;
+	const struct counter_silabs_timer_config *config = ce->dev->config;
+	unsigned int key = irq_lock();
+
+	ce->armed = false;
+	sl_hal_timer_disable_interrupts(config->timer, get_IEN_flag(ce->chan));
+	sl_hal_timer_clear_interrupts(config->timer, get_IF_flag(ce->chan));
+	irq_unlock(key);
+}
+
+static int counter_silabs_timer_ce_event_init(void *context, struct k_clock_event *event,
+					      k_clock_event_handler_t handler,
+					      void *user_data);
+
+static const struct k_clock_event_backend counter_silabs_timer_ce_backend = {
+	.event_init = counter_silabs_timer_ce_event_init,
+	.now = counter_silabs_timer_ce_now,
+	.min_arm_cycles = counter_silabs_timer_ce_min_arm_cycles,
+	.arm_abs = counter_silabs_timer_ce_arm_abs,
+	.cancel = counter_silabs_timer_ce_cancel,
+	.frequency_hz = counter_silabs_timer_ce_frequency_hz,
+};
+
+/* Bind @p event to a free CC channel, allocated from the highest one down. */
+static int counter_silabs_timer_ce_event_init(void *context, struct k_clock_event *event,
+					      k_clock_event_handler_t handler,
+					      void *user_data)
+{
+	const struct counter_silabs_timer_clock_event *provider = context;
+	const struct device *dev = provider->dev;
+	const struct counter_silabs_timer_config *config = dev->config;
+	struct counter_silabs_timer_data *data = dev->data;
+	struct counter_silabs_timer_clock_event *ce = NULL;
+	unsigned int key = irq_lock();
+
+	for (int chan = config->info.channels - 1; chan >= 0; chan--) {
+		if (data->clock_events[chan].event == event) {
+			ce = &data->clock_events[chan];
+			break;
+		}
+		if (ce == NULL && data->clock_events[chan].event == NULL &&
+		    data->alarms[chan].callback == NULL) {
+			ce = &data->clock_events[chan];
+		}
+	}
+	if (ce != NULL) {
+		ce->event = event;
+	}
+	irq_unlock(key);
+	if (ce == NULL) {
+		return -EBUSY;
+	}
+	return k_clock_event_init(event, &counter_silabs_timer_ce_backend, ce, handler,
+				  user_data);
+}
+
+/* Returns the CC flags handled as clock events. */
+static uint32_t counter_silabs_timer_ce_isr(const struct device *dev, uint32_t pendings)
+{
+	const struct counter_silabs_timer_config *config = dev->config;
+	struct counter_silabs_timer_data *data = dev->data;
+	uint32_t now = sl_hal_timer_get_counter(config->timer);
+	uint32_t handled = 0U;
+
+	for (uint8_t chan = 0; chan < config->info.channels; chan++) {
+		struct counter_silabs_timer_clock_event *ce = &data->clock_events[chan];
+		uint32_t generation;
+		bool fire;
+
+		if (ce->event == NULL || (pendings & get_IF_flag(chan)) == 0U) {
+			continue;
+		}
+		handled |= get_IF_flag(chan);
+		unsigned int key = irq_lock();
+
+		sl_hal_timer_clear_interrupts(config->timer, get_IF_flag(chan));
+		fire = ce->armed && (int32_t)(ce->deadline - now) <= 0;
+		generation = ce->generation;
+		if (fire) {
+			ce->armed = false;
+			sl_hal_timer_disable_interrupts(config->timer, get_IEN_flag(chan));
+		}
+		irq_unlock(key);
+		if (fire) {
+			k_clock_event_fire(ce->event, generation);
+		}
+	}
+	return handled;
+}
+#endif
+
 static void counter_silabs_timer_isr(const struct device *dev)
 {
 	struct counter_silabs_timer_data *data = dev->data;
 	const struct counter_silabs_timer_config *config = dev->config;
 	uint32_t now_ticks;
 	uint32_t pendings = sl_hal_timer_get_enabled_pending_interrupts(config->timer);
+
+#if defined(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT)
+	pendings &= ~counter_silabs_timer_ce_isr(dev, pendings);
+#endif
 
 	counter_silabs_timer_get_value(dev, &now_ticks);
 
@@ -317,6 +516,33 @@ static int counter_silabs_timer_init(const struct device *dev)
 
 	/* Interrupt setting */
 	config->irq_config_func();
+#if defined(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT)
+	/* Only a full 32-bit counter can serve the generic wrapping cycle domain. */
+	if (config->info.max_top_value == UINT32_MAX) {
+		struct counter_silabs_timer_data *data = dev->data;
+
+		data->provider.dev = dev;
+		data->provider.chan = UINT8_MAX;
+		data->ce_frequency = counter_silabs_timer_get_freq(dev);
+		if (data->ce_frequency == 0U) {
+			return -EINVAL;
+		}
+		data->ce_min_lead = MAX(1U, (uint32_t)DIV_ROUND_UP(
+			(uint64_t)data->ce_frequency *
+			CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT_MIN_LEAD_NS, NSEC_PER_SEC));
+		for (uint8_t idx = 0; idx < config->info.channels; idx++) {
+			data->clock_events[idx].dev = dev;
+			data->clock_events[idx].chan = idx;
+		}
+		sl_hal_timer_start(config->timer);
+		err = k_clock_event_provider_register(&counter_silabs_timer_ce_backend,
+						      &data->provider,
+						      K_CLOCK_EVENT_POWER_ACTIVE);
+		if (err != 0) {
+			return err;
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -347,8 +573,14 @@ static int counter_silabs_timer_init(const struct device *dev)
 	                                                                                          \
 	static struct counter_alarm_cfg counter_alarm_data_##idx[DT_PROP(                         \
 						DT_INST_PARENT(idx), channels)];                  \
+	IF_ENABLED(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT, (                                     \
+	static struct counter_silabs_timer_clock_event counter_ce_data_##idx[DT_PROP(             \
+						DT_INST_PARENT(idx), channels)];                  \
+	))                                                                                        \
 	static struct counter_silabs_timer_data counter_silabs_timer_data_##idx = {               \
 		.alarms = counter_alarm_data_##idx,                                               \
+		IF_ENABLED(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT,                               \
+			   (.clock_events = counter_ce_data_##idx,))                              \
 	};                                                                                        \
 	                                                                                          \
 	DEVICE_DT_INST_DEFINE(idx,                                                                \

@@ -252,12 +252,21 @@ static int counter_silabs_clock_event_event_init(void *context,
 	return counter_silabs_burtc_clock_event_init(context, event, handler, user_data);
 }
 
+static uint32_t counter_silabs_clock_event_frequency_hz(void *context)
+{
+	ARG_UNUSED(context);
+
+	/* BURTC is the system timer when it provides clock events. */
+	return sys_clock_hw_cycles_per_sec();
+}
+
 static const struct k_clock_event_backend counter_silabs_clock_event_backend = {
 	.event_init = counter_silabs_clock_event_event_init,
 	.now = counter_silabs_clock_event_now,
 	.min_arm_cycles = counter_silabs_clock_event_min_arm_cycles,
 	.arm_abs = counter_silabs_clock_event_arm_abs,
 	.cancel = counter_silabs_clock_event_cancel,
+	.frequency_hz = counter_silabs_clock_event_frequency_hz,
 };
 
 int counter_silabs_burtc_clock_event_init(const struct device *dev,

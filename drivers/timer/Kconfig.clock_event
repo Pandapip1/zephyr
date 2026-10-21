@@ -1,0 +1,25 @@
+# Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+config CLOCK_EVENT_SYSTEM_TIMER
+	bool "System timer on the scheduler clock service"
+	select CLOCK_EVENT_SCHED
+	select TICKLESS_CAPABLE
+	select TIMER_HAS_64BIT_CYCLE_COUNTER
+	help
+	  Implement the system clock on k_clock_event_sched_now() and one
+	  scheduler clock-event client. Hardware cycles are the service's
+	  logical timebase, so every registered clock-event provider feeds
+	  system time: the fastest active-only provider while the CPU runs and
+	  the deep-sleep provider across deeper PM states. The SoC supplies the
+	  providers; this driver names none.
+
+config CLOCK_EVENT_SYSTEM_TIMER_MAX_TIMEOUT_MS
+	int "Longest single timeout (ms)"
+	depends on CLOCK_EVENT_SYSTEM_TIMER
+	default 1000
+	range 1 30000
+	help
+	  Upper bound for one hardware arm. Each deep-sleep expiry re-anchors the
+	  providers, so this also bounds how long their relative drift can
+	  accumulate while the CPU is awake.
