@@ -21,7 +21,9 @@ zephyr_library_sources_ifdef(CONFIG_CH32V00X_SYSTICK wch_systick_ch32v00x.c)
 zephyr_library_sources_ifdef(CONFIG_CMSDK_APB_TIMER cmsdk_apb_timer.c)
 zephyr_library_sources_ifdef(CONFIG_CORTEX_M_SYSTICK cortex_m_systick.c)
 zephyr_library_sources_ifdef(CONFIG_ESP32_SYS_TIMER esp32_sys_timer.c)
-zephyr_library_sources_ifdef(CONFIG_GECKO_BURTC_TIMER gecko_burtc_timer.c)
+# The Counter API driver owns BURTC when it is also the system clock.  Keeping
+# the legacy standalone driver out of that configuration prevents a second
+# owner from binding IRQ18/COMP.
 zephyr_library_sources_ifdef(CONFIG_HEXAGON_TIMER hexagon_timer.c)
 zephyr_library_sources_ifdef(CONFIG_HPET_TIMER hpet.c)
 zephyr_library_sources_ifdef(CONFIG_INFINEON_LP_TIMER_HAL infineon_lp_timer.c)

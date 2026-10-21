@@ -15,7 +15,9 @@
 #include <zephyr/drivers/counter.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/clock_control_silabs.h>
+#include <zephyr/drivers/timer/system_timer.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/clock.h>
 
 #include <sl_hal_burtc.h>
 
@@ -23,6 +25,14 @@ LOG_MODULE_REGISTER(counter_silabs_burtc, CONFIG_COUNTER_LOG_LEVEL);
 
 #define BURTC_MAX_VALUE (_BURTC_CNT_MASK)
 #define BURTC_ALARM_NUM 1
+
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+#define MAX_TIMEOUT_CYC (UINT32_MAX >> 1)
+/* BURTC LFSYNC writes need several LF-clock cycles to take effect. */
+#define MIN_DELAY_CYC 6U
+
+extern unsigned int z_clock_hw_cycles_per_sec;
+#endif
 
 struct counter_silabs_config {
 	struct counter_config_info info;
@@ -36,11 +46,149 @@ struct counter_silabs_data {
 #if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
 	counter_alarm_callback_t callback;
 	void *user_data;
+	bool alarm_armed;
+	uint32_t alarm_ticks;
 #else
 	counter_top_callback_t top_callback;
 	void *top_user_data;
 #endif
+	struct k_spinlock lock;
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	atomic_t last_count;
+	uint32_t cyc_per_tick;
+	uint32_t max_timeout_ticks;
+	uint32_t system_deadline;
+	bool system_deadline_armed;
+	/*
+	 * A relative Counter alarm can be more than half a 32-bit wrap away.
+	 * Keep track of whether COMP was explicitly programmed for that alarm:
+	 * after the match, CNT can already be numerically past the target, so a
+	 * signed subtraction alone cannot tell it apart from an alarm another
+	 * wrap away.
+	 */
+	bool compare_is_alarm;
+	bool system_clock_initialized;
+#endif
 };
+
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+static const struct device *system_clock_dev;
+
+static bool deadline_due(uint32_t deadline, uint32_t now)
+{
+	return (int32_t)(deadline - now) <= 0;
+}
+
+static bool deadline_first(uint32_t candidate, uint32_t current, uint32_t now)
+{
+	return (candidate - now) <= (current - now);
+}
+
+/* The one hardware compare is shared by the Counter API and the kernel. */
+static void counter_silabs_rearm_compare(struct counter_silabs_data *data, uint32_t now)
+{
+	bool armed = false;
+	bool alarm_selected = false;
+	uint32_t deadline = 0;
+
+	if (data->system_deadline_armed) {
+		deadline = data->system_deadline;
+		armed = true;
+	}
+#if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
+	if (data->alarm_armed) {
+		/*
+		 * The system-clock maximum timeout is below half a wrap.  A
+		 * relative Counter alarm farther away is deliberately left behind
+		 * that bounded wake-up until it enters the unambiguous half-wrap
+		 * window.  It must not be treated as an already-expired deadline.
+		 */
+		uint32_t alarm_delta = data->alarm_ticks - now;
+
+		if (alarm_delta < MAX_TIMEOUT_CYC &&
+		    (!armed || deadline_first(data->alarm_ticks, deadline, now))) {
+			deadline = data->alarm_ticks;
+			armed = true;
+			alarm_selected = true;
+		}
+	}
+#endif
+
+	if (armed) {
+		/*
+		 * A BURTC LFSYNC write needs several LF-clock cycles.  In
+		 * particular, Counter's EXPIRE_WHEN_LATE path must not set now+1
+		 * and accidentally turn a late callback into a full-wrap wait.
+		 */
+		if ((!alarm_selected && deadline_due(deadline, now)) ||
+		    (deadline - now) < MIN_DELAY_CYC) {
+			deadline = now + MIN_DELAY_CYC;
+		}
+		data->compare_is_alarm = alarm_selected;
+		sl_hal_burtc_set_compare(deadline);
+		sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
+	} else {
+		data->compare_is_alarm = false;
+		sl_hal_burtc_disable_interrupts(BURTC_IF_COMP);
+	}
+}
+
+void sys_clock_set_timeout(uint32_t ticks, bool idle)
+{
+	const struct device *dev = system_clock_dev;
+	struct counter_silabs_data *data;
+	uint32_t curr;
+	uint32_t prev;
+	uint32_t unannounced;
+	uint32_t to_announce;
+	k_spinlock_key_t key;
+
+	ARG_UNUSED(idle);
+	if (dev == NULL || !IS_ENABLED(CONFIG_TICKLESS_KERNEL)) {
+		return;
+	}
+
+	data = dev->data;
+	/* Zero means the nearest upcoming tick. */
+	ticks = CLAMP(ticks, 1U, data->max_timeout_ticks) - 1U;
+	key = k_spin_lock(&data->lock);
+	curr = sl_hal_burtc_get_counter();
+	prev = atomic_get(&data->last_count);
+	unannounced = (curr - prev) / data->cyc_per_tick;
+	to_announce = MIN(unannounced + ticks + 1U, data->max_timeout_ticks);
+	data->system_deadline = prev + to_announce * data->cyc_per_tick;
+	if ((data->system_deadline - curr) < MIN_DELAY_CYC) {
+		data->system_deadline += data->cyc_per_tick;
+	}
+	data->system_deadline_armed = true;
+	counter_silabs_rearm_compare(data, curr);
+	k_spin_unlock(&data->lock, key);
+}
+
+uint32_t sys_clock_elapsed(void)
+{
+	const struct device *dev = system_clock_dev;
+	const struct counter_silabs_data *data;
+
+	if (dev == NULL) {
+		return 0;
+	}
+	data = dev->data;
+	if (!IS_ENABLED(CONFIG_TICKLESS_KERNEL) || !data->system_clock_initialized) {
+		return 0;
+	}
+	return (sl_hal_burtc_get_counter() - atomic_get(&data->last_count)) / data->cyc_per_tick;
+}
+
+uint32_t sys_clock_cycle_get_32(void)
+{
+	if (system_clock_dev == NULL ||
+	    !((const struct counter_silabs_data *)system_clock_dev->data)->system_clock_initialized) {
+		return 0;
+	}
+	return sl_hal_burtc_get_counter();
+}
+#endif
 
 static int counter_silabs_start(const struct device *dev)
 {
@@ -52,10 +200,16 @@ static int counter_silabs_start(const struct device *dev)
 
 static int counter_silabs_stop(const struct device *dev)
 {
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	/* The public Counter is also Zephyr's monotonic system-clock source. */
+	ARG_UNUSED(dev);
+	return -ENOTSUP;
+#else
 	ARG_UNUSED(dev);
 
 	sl_hal_burtc_stop();
 	return 0;
+#endif
 }
 
 static int counter_silabs_get_value(const struct device *dev, uint32_t *ticks)
@@ -69,7 +223,12 @@ static int counter_silabs_get_value(const struct device *dev, uint32_t *ticks)
 static uint32_t counter_silabs_get_top_value(const struct device *dev)
 {
 	ARG_UNUSED(dev);
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	/* COMP is a transient muxed deadline, not the free-running counter top. */
+	return BURTC_MAX_VALUE;
+#else
 	return sl_hal_burtc_get_compare();
+#endif
 }
 
 static uint32_t counter_silabs_get_freq(const struct device *dev)
@@ -92,21 +251,24 @@ static int counter_silabs_set_alarm(const struct device *dev, uint8_t chan_id,
 	struct counter_silabs_data *const dev_data = dev->data;
 	uint32_t alarm_ticks = alarm_cfg->ticks;
 	uint32_t now;
+	k_spinlock_key_t key;
 
 	/* BURTC has only one channel */
 	if (chan_id != 0) {
 		return -EINVAL;
 	}
 
+	key = k_spin_lock(&dev_data->lock);
 	/* No need to validate top value because burtc doesn't support it. */
-	if (dev_data->callback != NULL) {
+	if (dev_data->alarm_armed) {
+		k_spin_unlock(&dev_data->lock, key);
 		return -EINVAL;
 	}
 
+	now = sl_hal_burtc_get_counter();
 	if (!(alarm_cfg->flags & COUNTER_ALARM_CFG_ABSOLUTE)) {
-		alarm_ticks += sl_hal_burtc_get_counter();
+		alarm_ticks += now;
 	} else {
-		now = sl_hal_burtc_get_counter();
 		/*
 		 * BURTC compares are one-shot absolute matches.  A compare value
 		 * already behind CNT would otherwise wait for the 32-bit wrap,
@@ -114,6 +276,7 @@ static int counter_silabs_set_alarm(const struct device *dev, uint8_t chan_id,
 		 */
 		if ((int32_t)(alarm_ticks - now) <= 0) {
 			if (!(alarm_cfg->flags & COUNTER_ALARM_CFG_EXPIRE_WHEN_LATE)) {
+				k_spin_unlock(&dev_data->lock, key);
 				return -ETIME;
 			}
 			/* Program the next tick so callback delivery remains IRQ-owned. */
@@ -121,36 +284,47 @@ static int counter_silabs_set_alarm(const struct device *dev, uint8_t chan_id,
 		}
 	}
 
-	sl_hal_burtc_clear_interrupts(BURTC_IF_COMP);
-
 	dev_data->callback = alarm_cfg->callback;
 	dev_data->user_data = alarm_cfg->user_data;
+	dev_data->alarm_ticks = alarm_ticks;
+	dev_data->alarm_armed = true;
 
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	counter_silabs_rearm_compare(dev_data, now);
+#else
+	sl_hal_burtc_clear_interrupts(BURTC_IF_COMP);
 	sl_hal_burtc_set_compare(alarm_ticks);
-	LOG_DBG("set alarm: %u", alarm_ticks);
-
-	/* Enable the compare interrupt */
 	sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
+#endif
+	k_spin_unlock(&dev_data->lock, key);
+	LOG_DBG("set alarm: %u", alarm_ticks);
 	return 0;
 }
 
 static int counter_silabs_cancel_alarm(const struct device *dev, uint8_t chan_id)
 {
 	struct counter_silabs_data *const dev_data = dev->data;
+	k_spinlock_key_t key;
 
 	/* BURTC has only one channel */
 	if (chan_id != 0) {
 		return -EINVAL;
 	}
 
+	key = k_spin_lock(&dev_data->lock);
+	dev_data->callback = NULL;
+	dev_data->user_data = NULL;
+	dev_data->alarm_armed = false;
+
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	counter_silabs_rearm_compare(dev_data, sl_hal_burtc_get_counter());
+#else
 	/* Disable the compare interrupt */
 	sl_hal_burtc_disable_interrupts(BURTC_IF_COMP);
 	sl_hal_burtc_clear_interrupts(BURTC_IF_COMP);
-
-	dev_data->callback = NULL;
-	dev_data->user_data = NULL;
-
 	sl_hal_burtc_set_compare(0);
+#endif
+	k_spin_unlock(&dev_data->lock, key);
 	LOG_DBG("cancel alarm");
 	return 0;
 }
@@ -165,6 +339,11 @@ static int counter_silabs_set_top_value(const struct device *dev, const struct c
 #else
 static int counter_silabs_set_top_value(const struct device *dev, const struct counter_top_cfg *cfg)
 {
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cfg);
+	return -ENOTSUP;
+#else
 	struct counter_silabs_data *const dev_data = dev->data;
 	uint32_t ticks;
 	uint32_t flags;
@@ -193,6 +372,7 @@ static int counter_silabs_set_top_value(const struct device *dev, const struct c
 	/* Enable the compare interrupt */
 	sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
 	return err;
+#endif
 }
 
 static int counter_silabs_set_alarm(const struct device *dev, uint8_t chan_id,
@@ -222,6 +402,7 @@ static int counter_silabs_init(const struct device *dev)
 {
 	int err = 0;
 	const struct counter_silabs_config *const burtc_cfg = dev->config;
+	struct counter_silabs_data *const data = dev->data;
 
 	sl_hal_burtc_init_t burtc_config = {
 		burtc_cfg->prescaler, /* Set clkdiv. */
@@ -246,6 +427,8 @@ static int counter_silabs_init(const struct device *dev)
 	/* Initialize BURTC */
 	sl_hal_burtc_init(&burtc_config);
 	sl_hal_burtc_enable();
+	/* A system clock must run before any Counter client has called start(). */
+	sl_hal_burtc_start();
 
 	/* Disable module's internal interrupt sources */
 	sl_hal_burtc_disable_interrupts(BURTC_IF_COMP | BURTC_IF_OF);
@@ -254,8 +437,30 @@ static int counter_silabs_init(const struct device *dev)
 	/* Clear the counter */
 	sl_hal_burtc_reset_counter();
 
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	z_clock_hw_cycles_per_sec = counter_silabs_get_freq(dev);
+	if (z_clock_hw_cycles_per_sec == 0U) {
+		return -EINVAL;
+	}
+	BUILD_ASSERT(CONFIG_SYS_CLOCK_TICKS_PER_SEC > 0,
+		     "Invalid CONFIG_SYS_CLOCK_TICKS_PER_SEC value");
+	data->cyc_per_tick = z_clock_hw_cycles_per_sec / CONFIG_SYS_CLOCK_TICKS_PER_SEC;
+	__ASSERT(data->cyc_per_tick >= MIN_DELAY_CYC,
+		 "%u cycle-long tick is too short to be scheduled (min is %u)",
+		 data->cyc_per_tick, MIN_DELAY_CYC);
+	data->max_timeout_ticks = MAX_TIMEOUT_CYC / data->cyc_per_tick;
+	atomic_set(&data->last_count, 0);
+	data->system_deadline = data->cyc_per_tick;
+	data->system_deadline_armed = true;
+	data->system_clock_initialized = true;
+	system_clock_dev = dev;
+#endif
+
 	/* Configure & enable module interrupts */
 	burtc_cfg->irq_config();
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	counter_silabs_rearm_compare(data, sl_hal_burtc_get_counter());
+#endif
 	LOG_INF("Device %s initialized", dev->name);
 	return 0;
 }
@@ -278,36 +483,88 @@ void counter_silabs_isr_handler(const struct device *dev)
 	uint32_t flags = sl_hal_burtc_get_enabled_pending_interrupts();
 #if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
 	counter_alarm_callback_t alarm_callback;
+	void *alarm_user_data;
+#endif
+#if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM) || defined(CONFIG_GECKO_BURTC_TIMER)
+	uint32_t now;
+	k_spinlock_key_t key;
+#endif
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	uint32_t prev;
+	uint32_t unannounced;
 #endif
 
 	sl_hal_burtc_clear_interrupts(flags);
+	if (!(flags & BURTC_IF_COMP)) {
+		return;
+	}
+
+#if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM) || defined(CONFIG_GECKO_BURTC_TIMER)
+	now = sl_hal_burtc_get_counter();
+	key = k_spin_lock(&burtc_data->lock);
+#endif
 
 #if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
-	if (flags & BURTC_IF_COMP && burtc_data->callback) {
+	alarm_callback = NULL;
+	alarm_user_data = NULL;
+	if (burtc_data->alarm_armed
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	    && burtc_data->compare_is_alarm
+#endif
+	) {
 		alarm_callback = burtc_data->callback;
+		alarm_user_data = burtc_data->user_data;
 		burtc_data->callback = NULL;
-		alarm_callback(dev, 0, sl_hal_burtc_get_counter(), burtc_data->user_data);
+		burtc_data->user_data = NULL;
+		burtc_data->alarm_armed = false;
+	}
+#endif
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	prev = atomic_get(&burtc_data->last_count);
+	unannounced = (now - prev) / burtc_data->cyc_per_tick;
+	atomic_set(&burtc_data->last_count,
+		   prev + unannounced * burtc_data->cyc_per_tick);
+	if (burtc_data->system_deadline_armed &&
+	    deadline_due(burtc_data->system_deadline, now)) {
+		if (IS_ENABLED(CONFIG_TICKLESS_KERNEL)) {
+			burtc_data->system_deadline_armed = false;
+		} else {
+			burtc_data->system_deadline = prev + burtc_data->cyc_per_tick;
+			if ((burtc_data->system_deadline - now) < MIN_DELAY_CYC) {
+				burtc_data->system_deadline += burtc_data->cyc_per_tick;
+			}
+		}
+	}
+	counter_silabs_rearm_compare(burtc_data, now);
+#endif
+#if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM) || defined(CONFIG_GECKO_BURTC_TIMER)
+	k_spin_unlock(&burtc_data->lock, key);
+#endif
+
+#if defined(CONFIG_GECKO_BURTC_TIMER)
+	sys_clock_announce(unannounced);
+#endif
+#if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
+	if (alarm_callback) {
+		alarm_callback(dev, 0, now, alarm_user_data);
 	}
 #else
-	if (flags & BURTC_IF_COMP && burtc_data->top_callback) {
+	if (burtc_data->top_callback) {
 		burtc_data->top_callback(dev, burtc_data->top_user_data);
 	}
 #endif
 }
 
 #define BURTC_INIT(n)                                                                              \
-	ISR_DIRECT_DECLARE(counter_silabs_isr_##n)                                                 \
+	static void counter_silabs_isr_##n(const void *arg)                                    \
 	{                                                                                          \
-		const struct device *const dev = DEVICE_DT_INST_GET(n);                            \
-		counter_silabs_isr_handler(dev);                                                   \
-		ISR_DIRECT_PM();                                                                   \
-		return 1;                                                                          \
+		counter_silabs_isr_handler(arg);                                                   \
 	}                                                                                          \
                                                                                                    \
 	static void counter_silabs_irq_config_##n(void)                                            \
 	{                                                                                          \
-		IRQ_DIRECT_CONNECT(DT_INST_IRQN(n), DT_INST_IRQ(n, priority),                      \
-				   counter_silabs_isr_##n, n);                                     \
+		IRQ_CONNECT(DT_INST_IRQN(n), DT_INST_IRQ(n, priority),                             \
+				    counter_silabs_isr_##n, DEVICE_DT_INST_GET(n), 0);             \
 		irq_enable(DT_INST_IRQN(n));                                                       \
 	}                                                                                          \
                                                                                                    \

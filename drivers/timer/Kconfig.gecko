@@ -4,13 +4,16 @@
 config GECKO_BURTC_TIMER
 	bool "SiLabs Gecko BURTC system clock driver"
 	depends on SOC_FAMILY_SILABS_S2
-	depends on DT_HAS_SILABS_GECKO_BURTC_ENABLED
-	select SILABS_SISDK_BURTC
+	depends on DT_HAS_SILABS_BURTC_COUNTER_ENABLED
+	select COUNTER_SILABS_BURTC
+	select COUNTER_SILABS_BURTC_ALARM
 	select TICKLESS_CAPABLE
 	select TIMER_READS_ITS_FREQUENCY_AT_RUNTIME
 	help
-	  If you enable this, BURTC will be used to provide hw_cycles and
-	  kernel ticks instead of Cortex-M SysTick. You need this for system
+	  If you enable this, the Counter API's BURTC instance will also provide
+	  hw_cycles and kernel ticks instead of Cortex-M SysTick. The combined
+	  driver is the sole owner of BURTC's COMP interrupt and multiplexes its
+	  kernel deadline with the Counter API's one-shot alarm. You need this for system
 	  to be able to keep track of time and wake up from EM2 & EM3 sleep
 	  states.
 
