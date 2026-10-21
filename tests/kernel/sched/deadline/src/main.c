@@ -67,6 +67,15 @@ static void event_latch_post_twice(const void *param)
 	k_deadline_event_post(event, K_DEADLINE(MSEC_TO_CYCLES(10)));
 }
 
+static void event_latch_post_then_reset(const void *param)
+{
+	struct k_deadline_event *event = (struct k_deadline_event *)param;
+
+	/* One IRQ transaction proves reset wins before IRQ-exit scheduling. */
+	k_deadline_event_post(event, K_DEADLINE(MSEC_TO_CYCLES(10)));
+	k_deadline_event_reset(event);
+}
+
 static void event_latch_worker(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -235,6 +244,25 @@ ZTEST(suite_deadline, test_deadline_event_irq_latch)
 
 	zassert_equal(event_latch_runs, 2,
 		      "coalesced IRQ publication was lost or consumed more than once");
+	k_thread_abort(&event_latch_thread);
+}
+
+ZTEST(suite_deadline, test_deadline_event_reset_discards_pending)
+{
+	event_latch_runs = 0;
+	k_deadline_event_init(&event_latch);
+	k_sem_reset(&event_latch_armed);
+	k_sem_reset(&event_latch_done);
+
+	(void)k_thread_create(&event_latch_thread, event_latch_stack, STACK_SIZE,
+			      event_latch_worker, NULL, NULL, NULL,
+			      K_HIGHEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
+	k_sem_take(&event_latch_armed, K_FOREVER);
+	irq_offload(event_latch_post_then_reset, &event_latch);
+
+	/* The job was readied but has no event to consume, so it re-suspends. */
+	k_sleep(K_MSEC(1));
+	zassert_equal(event_latch_runs, 0, "reset publication ran");
 	k_thread_abort(&event_latch_thread);
 }
 

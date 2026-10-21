@@ -54,6 +54,15 @@ void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
 	}
 }
 
+void z_impl_k_deadline_event_reset(struct k_deadline_event *event)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	/* Do not alter consumer scheduling state: only discard an unread event. */
+	event->pending = false;
+	z_sched_spinlock_unlock(key);
+}
+
 void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 {
 	struct k_thread *thread = k_current_get();
@@ -101,6 +110,13 @@ static inline void z_vrfy_k_deadline_event_post(struct k_deadline_event *event,
 	z_impl_k_deadline_event_post(event, deadline);
 }
 #include <zephyr/syscalls/k_deadline_event_post_mrsh.c>
+
+static inline void z_vrfy_k_deadline_event_reset(struct k_deadline_event *event)
+{
+	K_OOPS(K_SYSCALL_OBJ(event, K_OBJ_DEADLINE_EVENT));
+	z_impl_k_deadline_event_reset(event);
+}
+#include <zephyr/syscalls/k_deadline_event_reset_mrsh.c>
 
 static inline void z_vrfy_k_deadline_event_wait(struct k_deadline_event *event)
 {

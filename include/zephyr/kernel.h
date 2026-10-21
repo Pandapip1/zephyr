@@ -1163,6 +1163,17 @@ __syscall void k_deadline_event_init(struct k_deadline_event *event);
 __syscall void k_deadline_event_post(struct k_deadline_event *event, int deadline);
 
 /**
+ * @brief Discard an unconsumed deadline-event publication.
+ *
+ * This clears only the coalesced pending bit. It neither suspends a ready or
+ * running consumer nor cancels work that consumer has already consumed.
+ * Pair it with an application generation guard when teardown can race work.
+ *
+ * @param event Deadline event to reset.
+ */
+__syscall void k_deadline_event_reset(struct k_deadline_event *event);
+
+/**
  * @brief Consume a pending event or atomically suspend the calling consumer.
  *
  * A deadline event supports exactly one consumer thread.  This routine must
