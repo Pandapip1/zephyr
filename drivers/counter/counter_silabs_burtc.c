@@ -13,6 +13,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/counter.h>
+#include <zephyr/drivers/counter/silabs_burtc.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/clock_control_silabs.h>
 #include <zephyr/drivers/timer/system_timer.h>
@@ -67,6 +68,13 @@ struct counter_silabs_data {
 	 * wrap away.
 	 */
 	bool compare_is_alarm;
+	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+	/* One generic client shares the single COMP mux with Counter and sysclock. */
+	struct k_clock_event *clock_event;
+	uint32_t clock_event_deadline;
+	uint32_t clock_event_generation;
+	bool clock_event_armed;
+	#endif
 	bool system_clock_initialized;
 #endif
 };
@@ -89,6 +97,9 @@ static void counter_silabs_rearm_compare(struct counter_silabs_data *data, uint3
 {
 	bool armed = false;
 	bool alarm_selected = false;
+	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+	bool clock_event_selected = false;
+	#endif
 	uint32_t deadline = 0;
 
 	if (data->system_deadline_armed) {
@@ -113,6 +124,19 @@ static void counter_silabs_rearm_compare(struct counter_silabs_data *data, uint3
 		}
 	}
 #endif
+	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+	if (data->clock_event_armed) {
+		uint32_t event_delta = data->clock_event_deadline - now;
+
+		if (event_delta < MAX_TIMEOUT_CYC &&
+		    (!armed || deadline_first(data->clock_event_deadline, deadline, now))) {
+			deadline = data->clock_event_deadline;
+			armed = true;
+			clock_event_selected = true;
+			alarm_selected = false;
+		}
+	}
+	#endif
 
 	if (armed) {
 		/*
@@ -125,7 +149,11 @@ static void counter_silabs_rearm_compare(struct counter_silabs_data *data, uint3
 		 * Do not keep moving it to now + MIN_DELAY_CYC every time the system
 		 * clock re-arms COMP: that can starve a short client alarm forever.
 		 */
-		if (!alarm_selected &&
+		if (!alarm_selected
+		#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+		    && !clock_event_selected
+		#endif
+		    &&
 		    (deadline_due(deadline, now) ||
 		     (deadline - now) < MIN_DELAY_CYC)) {
 			deadline = now + MIN_DELAY_CYC;
@@ -138,6 +166,96 @@ static void counter_silabs_rearm_compare(struct counter_silabs_data *data, uint3
 		sl_hal_burtc_disable_interrupts(BURTC_IF_COMP);
 	}
 }
+
+#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+static uint32_t counter_silabs_clock_event_now(void *context)
+{
+	ARG_UNUSED(context);
+	return sl_hal_burtc_get_counter();
+}
+
+static uint32_t counter_silabs_clock_event_min_arm_cycles(void *context)
+{
+	ARG_UNUSED(context);
+	return MIN_DELAY_CYC;
+}
+
+static int counter_silabs_clock_event_arm_abs(void *context, uint32_t deadline,
+					      uint32_t generation)
+{
+	const struct device *dev = context;
+	struct counter_silabs_data *data = dev->data;
+	uint32_t now;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&data->lock);
+	now = sl_hal_burtc_get_counter();
+	if ((int32_t)(deadline - now) < MIN_DELAY_CYC) {
+		k_spin_unlock(&data->lock, key);
+		return -ETIME;
+	}
+
+	data->clock_event_deadline = deadline;
+	data->clock_event_generation = generation;
+	data->clock_event_armed = true;
+	counter_silabs_rearm_compare(data, now);
+	k_spin_unlock(&data->lock, key);
+	return 0;
+}
+
+static void counter_silabs_clock_event_cancel(void *context)
+{
+	const struct device *dev = context;
+	struct counter_silabs_data *data = dev->data;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&data->lock);
+	data->clock_event_armed = false;
+	counter_silabs_rearm_compare(data, sl_hal_burtc_get_counter());
+	k_spin_unlock(&data->lock, key);
+}
+
+static const struct k_clock_event_backend counter_silabs_clock_event_backend = {
+	.now = counter_silabs_clock_event_now,
+	.min_arm_cycles = counter_silabs_clock_event_min_arm_cycles,
+	.arm_abs = counter_silabs_clock_event_arm_abs,
+	.cancel = counter_silabs_clock_event_cancel,
+};
+
+int counter_silabs_burtc_clock_event_init(const struct device *dev,
+					  struct k_clock_event *event,
+					  k_clock_event_handler_t handler,
+					  void *user_data)
+{
+	struct counter_silabs_data *data;
+	k_spinlock_key_t key;
+	int ret;
+
+	if (!device_is_ready(dev) || event == NULL) {
+		return -EINVAL;
+	}
+
+	data = dev->data;
+	key = k_spin_lock(&data->lock);
+	if (data->clock_event != NULL && data->clock_event != event) {
+		k_spin_unlock(&data->lock, key);
+		return -EBUSY;
+	}
+	data->clock_event = event;
+	k_spin_unlock(&data->lock, key);
+
+	ret = k_clock_event_init(event, &counter_silabs_clock_event_backend,
+				 (void *)dev, handler, user_data);
+	if (ret != 0) {
+		key = k_spin_lock(&data->lock);
+		if (data->clock_event == event) {
+			data->clock_event = NULL;
+		}
+		k_spin_unlock(&data->lock, key);
+	}
+	return ret;
+}
+#endif
 
 void sys_clock_set_timeout(uint32_t ticks, bool idle)
 {
@@ -507,6 +625,10 @@ void counter_silabs_isr_handler(const struct device *dev)
 	uint32_t prev;
 	uint32_t unannounced;
 #endif
+	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+	struct k_clock_event *clock_event = NULL;
+	uint32_t clock_event_generation = 0U;
+	#endif
 
 	sl_hal_burtc_clear_interrupts(flags);
 	if (!(flags & BURTC_IF_COMP)) {
@@ -534,6 +656,15 @@ void counter_silabs_isr_handler(const struct device *dev)
 	}
 #endif
 #if defined(CONFIG_GECKO_BURTC_TIMER)
+	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+	/* The generic event deadline is within its half-wrap validity window. */
+	if (burtc_data->clock_event_armed &&
+	    deadline_due(burtc_data->clock_event_deadline, now)) {
+		clock_event = burtc_data->clock_event;
+		clock_event_generation = burtc_data->clock_event_generation;
+		burtc_data->clock_event_armed = false;
+	}
+	#endif
 	prev = atomic_get(&burtc_data->last_count);
 	unannounced = (now - prev) / burtc_data->cyc_per_tick;
 	atomic_set(&burtc_data->last_count,
@@ -558,6 +689,12 @@ void counter_silabs_isr_handler(const struct device *dev)
 #if defined(CONFIG_GECKO_BURTC_TIMER)
 	sys_clock_announce(unannounced);
 #endif
+	#if defined(CONFIG_COUNTER_SILABS_BURTC_CLOCK_EVENT)
+	if (clock_event != NULL) {
+		/* Do not take the generic event lock while holding the BURTC mux lock. */
+		k_clock_event_fire(clock_event, clock_event_generation);
+	}
+	#endif
 #if defined(CONFIG_COUNTER_SILABS_BURTC_ALARM)
 	if (alarm_callback) {
 		alarm_callback(dev, 0, now, alarm_user_data);

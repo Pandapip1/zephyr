@@ -71,6 +71,16 @@ config COUNTER_SILABS_BURTC_ALARM
 	  set and cancel ALARM will return -ENOTSUP). Choose the configuration
 	  that matches your application's requirements.
 
+config COUNTER_SILABS_BURTC_CLOCK_EVENT
+	bool "BURTC absolute clock-event provider"
+	depends on COUNTER_SILABS_BURTC && GECKO_BURTC_TIMER
+	select CLOCK_EVENT
+	help
+	  Expose the combined BURTC Counter/system-clock driver's COMP mux as one
+	  generic absolute clock event. The provider shares COMP with the kernel
+	  system clock and the Counter API alarm; it does not allocate another
+	  hardware compare channel.
+
 config COUNTER_SILABS_TIMER
 	bool "Silicon Labs Series 2 TIMER Counter driver"
 	default y
