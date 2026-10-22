@@ -56,8 +56,6 @@ configdefault SILABS_SISDK_EMU
 # large, especially with logs enabled. Since it is called from IDLE task,
 # its stack size has to be increased
 configdefault IDLE_STACK_SIZE
-	# Idle entry arms the next wake-up through the scheduler clock service (about 300 bytes).
-	default 640 if PM && CLOCK_EVENT_SYSTEM_TIMER
 	default 512 if PM
 
 configdefault NUM_METAIRQ_PRIORITIES
