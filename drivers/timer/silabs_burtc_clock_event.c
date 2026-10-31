@@ -12,8 +12,28 @@
  * shared, a latched COMP flag only says that some event matched: each event
  * is delivered only once CNT has reached its own deadline. An event already
  * due without its own match pends the IRQ instead of having a past value
- * written to COMP, and only the programmed COMP value is clamped to the
- * LFSYNC write floor.
+ * written to COMP.
+ *
+ * COMP is an LF-synchronized register (EFR32xG22 reference manual, BURTC
+ * register access; timings measured on an EFR32BG22 with BURTC on LFXO):
+ *
+ * - A COMP write takes effect at the third LF edge after the bus write.
+ *   SYNCBUSY.COMP is set until then, 2.0 to 3.0 LF periods (61 to 92 us),
+ *   and COMP reads the old value meanwhile.
+ * - IF.COMP sets on the edge where CNT advances from COMP to COMP + 1.
+ * - COMP = CNT + d (CNT read just before the write) fires for d >= 3; for
+ *   d <= 2 it waits for the 32-bit wrap.
+ * - Rewriting COMP while CNT reads COMP - k still delivers the old match for
+ *   k <= 2.
+ *
+ * So COMP is programmed one count before the deadline, and nothing here ever
+ * waits for SYNCBUSY: sl_hal_burtc_set_compare() would spin up to two sync
+ * periods (183 us) with interrupts locked, which is longer than the
+ * scheduler's lateness tolerance. While a write is still synchronizing, a
+ * target no earlier than the pending match keeps it (that match fires first
+ * and the IRQ re-arms); an earlier target is refused with -EBUSY, to be
+ * retried by the caller once the write has landed, within MIN_DELAY_CYC.
+ * Old or early matches are harmless: the IRQ re-checks every deadline.
  */
 
 #define DT_DRV_COMPAT silabs_burtc_counter
@@ -32,8 +52,19 @@
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) == 1,
 	     "exactly one BURTC instance must be enabled");
 
-/* BURTC LFSYNC writes need several LF-clock cycles to take effect. */
-#define MIN_DELAY_CYC 6U
+/* IF.COMP sets as CNT leaves COMP: program COMP this many counts before the deadline. */
+#define COMP_MATCH_OFFSET 1U
+/* A COMP write takes effect at this LF edge after the write. */
+#define COMP_SYNC_EDGES   3U
+/* CNT may advance once between the read that decides a target and the COMP write. */
+#define COMP_READ_SKEW    1U
+/*
+ * Minimum lead from the CNT read to a deadline: the written COMP must still
+ * be at least COMP_SYNC_EDGES ahead of CNT when the write is issued. It is
+ * also the longest a refused (-EBUSY) caller waits before the synchronizing
+ * write has landed, since every write is issued with at least this lead.
+ */
+#define MIN_DELAY_CYC     (COMP_MATCH_OFFSET + COMP_SYNC_EDGES + COMP_READ_SKEW)
 #define SLOTS         CONFIG_SILABS_BURTC_CLOCK_EVENT_SLOTS
 
 struct burtc_slot {
@@ -46,16 +77,26 @@ struct burtc_slot {
 static struct k_spinlock lock;
 static struct burtc_slot slots[SLOTS];
 static uint32_t frequency;
-/* Last COMP value and the CNT at which it was written. */
-static uint32_t compare_value;
-static uint32_t compare_written_at;
+/* Deadline whose match the last COMP write programs. */
+static uint32_t compare_deadline;
+static bool compare_written;
 
 static bool deadline_due(uint32_t deadline, uint32_t now)
 {
 	return (int32_t)(deadline - now) <= 0;
 }
 
-static void rearm_locked(uint32_t now)
+static bool compare_syncing(void)
+{
+	return (BURTC->SYNCBUSY & BURTC_SYNCBUSY_COMP) != 0U;
+}
+
+/*
+ * Program COMP for the earliest armed deadline. Returns -EBUSY when that
+ * needs a COMP write while an earlier one is still synchronizing and the
+ * pending match would come after it; the hardware is then left as it was.
+ */
+static int rearm_locked(uint32_t now)
 {
 	bool armed = false;
 	bool due = false;
@@ -77,30 +118,40 @@ static void rearm_locked(uint32_t now)
 		/* Writing a past COMP would wait for a wrap: pend the IRQ instead. */
 		sl_hal_burtc_set_interrupts(BURTC_IF_COMP);
 		sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
-		return;
+		return 0;
 	}
 	if (!armed) {
+		/* A synchronizing or stale match may still latch IF; the IRQ ignores it. */
 		sl_hal_burtc_disable_interrupts(BURTC_IF_COMP);
-		return;
+		return 0;
 	}
+	/*
+	 * Keep a programmed match for a deadline still ahead and no later than
+	 * this one when it is this deadline's, when a write cannot replace it
+	 * yet, or when a rewrite would no longer cancel it: it fires first and
+	 * the IRQ re-arms. Otherwise write the exact deadline, so that a far
+	 * early match does not cost a spurious wake.
+	 */
+	if (compare_written && !deadline_due(compare_deadline, now) &&
+	    (compare_deadline - now) <= (deadline - now) &&
+	    (compare_deadline == deadline || compare_syncing() ||
+	     (compare_deadline - now) < MIN_DELAY_CYC)) {
+		sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
+		return 0;
+	}
+	if (compare_syncing()) {
+		return -EBUSY;
+	}
+	/* A nearer remaining deadline (after an IRQ or cancel) is delayed to the lead, never early. */
 	if ((deadline - now) < MIN_DELAY_CYC) {
-		/*
-		 * Keep an earlier write that already lands in
-		 * [deadline, now + MIN_DELAY_CYC]; rewriting it on every re-mux
-		 * would keep pushing a near deadline back.
-		 */
-		if ((compare_value - compare_written_at) >= MIN_DELAY_CYC &&
-		    (compare_value - now) <= MIN_DELAY_CYC && !deadline_due(compare_value, now) &&
-		    (deadline - now) <= (compare_value - now)) {
-			sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
-			return;
-		}
 		deadline = now + MIN_DELAY_CYC;
 	}
-	compare_value = deadline;
-	compare_written_at = now;
-	sl_hal_burtc_set_compare(deadline);
+	compare_deadline = deadline;
+	compare_written = true;
+	/* Not sl_hal_burtc_set_compare(): it spins on SYNCBUSY before and after the write. */
+	BURTC->COMP = deadline - COMP_MATCH_OFFSET;
 	sl_hal_burtc_enable_interrupts(BURTC_IF_COMP);
+	return 0;
 }
 
 static uint32_t burtc_now(void *context)
@@ -139,7 +190,10 @@ static int burtc_arm_abs(void *context, uint32_t deadline, uint32_t generation)
 		slot->deadline = deadline;
 		slot->generation = generation;
 		slot->armed = true;
-		rearm_locked(now);
+		ret = rearm_locked(now);
+		if (ret != 0) {
+			slot->armed = false;
+		}
 	}
 	return ret;
 }
@@ -150,7 +204,8 @@ static void burtc_cancel(void *context)
 
 	K_SPINLOCK(&lock) {
 		slot->armed = false;
-		rearm_locked(sl_hal_burtc_get_counter());
+		/* Only later deadlines remain: a pending match covers them (-EBUSY is moot). */
+		(void)rearm_locked(sl_hal_burtc_get_counter());
 	}
 }
 
@@ -209,7 +264,12 @@ static void burtc_isr(const void *arg)
 				generations[i] = slots[i].generation;
 			}
 		}
-		rearm_locked(now);
+		/*
+		 * -EBUSY: a write still synchronizing holds a pending match, which
+		 * fires and re-arms here; every armed deadline was accepted no
+		 * earlier than the match programmed for it.
+		 */
+		(void)rearm_locked(now);
 	}
 	/* Handlers may arm or cancel again, so run them outside the mux lock. */
 	ARRAY_FOR_EACH(events, i) {
