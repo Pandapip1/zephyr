@@ -17,6 +17,7 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/kernel/deadline_miss.h>
 #include <kspinlock.h>
 #include <ksched.h>
 #include <run_q.h>
@@ -33,13 +34,18 @@ void z_impl_k_deadline_event_init(struct k_deadline_event *event)
 	event->consumer = NULL;
 	event->deadline = 0;
 	event->pending = false;
+	event->released_idle = false;
 	z_sched_spinlock_unlock(key);
 }
 
 void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
 {
+	/* Read the clock outside the scheduler lock: it may take a lock of its own. */
+	uint32_t now = k_cycle_get_32();
 	k_spinlock_key_t key = z_sched_spinlock_lock();
 	struct k_thread *thread = event->consumer;
+	bool idle = (thread != NULL) && z_is_thread_suspended(thread) &&
+		    ((thread->base.thread_state & ~_THREAD_SUSPENDED) == 0U);
 
 	/*
 	 * Never count publications, but keep the earliest deadline among those
@@ -48,9 +54,19 @@ void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
 	if (!event->pending || (int32_t)((uint32_t)deadline - (uint32_t)event->deadline) < 0) {
 		event->deadline = deadline;
 	}
+	if (!event->pending) {
+		/*
+		 * A publication that finds its consumer idle releases a job that must
+		 * start by its deadline. One latched while the consumer runs belongs
+		 * to that busy period: the run in progress may serve it, so only its
+		 * deadline, as an ordering key, carries over to the next run.
+		 */
+		event->released_idle = idle;
+		event->release = now;
+		event->released_over = _current;
+	}
 	event->pending = true;
-	if ((thread != NULL) && z_is_thread_suspended(thread) &&
-	    ((thread->base.thread_state & ~_THREAD_SUSPENDED) == 0U)) {
+	if (idle) {
 		/* Assign the EDF key before making the consumer observable as ready. */
 		thread->base.prio_deadline = event->deadline;
 		z_mark_thread_as_not_suspended(thread);
@@ -68,6 +84,30 @@ void z_impl_k_deadline_event_reset(struct k_deadline_event *event)
 	/* Do not alter consumer scheduling state: only discard an unread event. */
 	event->pending = false;
 	z_sched_spinlock_unlock(key);
+}
+
+/* Check the start of a run released from idle against its deadline. */
+static void deadline_event_started(struct k_deadline_event *event, int deadline,
+				   bool released_idle, uint32_t release,
+				   struct k_thread *released_over)
+{
+	uint32_t now = k_cycle_get_32();
+
+	z_deadline_miss_job_start(event, now);
+	if (released_idle && (int32_t)(now - (uint32_t)deadline) > 0) {
+		struct k_deadline_miss miss = {
+			.kind = K_DEADLINE_MISS_START,
+			.object = event,
+			.name = event->name,
+			.thread = _current,
+			.release = release,
+			.deadline = deadline,
+			.now = now,
+			.running_at_release = released_over,
+		};
+
+		z_deadline_miss_report(&miss);
+	}
 }
 
 void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
@@ -88,6 +128,9 @@ void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 
 		if (event->pending) {
 			int deadline = event->deadline;
+			bool released_idle = event->released_idle;
+			uint32_t release = event->release;
+			struct k_thread *released_over = event->released_over;
 
 			event->pending = false;
 			z_sched_spinlock_unlock(key);
@@ -97,6 +140,8 @@ void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 			 * its own deadline, never the key of an earlier run.
 			 */
 			z_sched_current_deadline_update(deadline);
+			deadline_event_started(event, deadline, released_idle, release,
+					       released_over);
 			return;
 		}
 

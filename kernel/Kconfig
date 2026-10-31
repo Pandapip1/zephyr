@@ -137,6 +137,48 @@ config SCHED_DEADLINE
 	  single priority will choose the next expiring deadline and
 	  not simply the least recently added thread.
 
+config SCHED_DEADLINE_MISS
+	def_bool SCHED_DEADLINE || CLOCK_EVENT_SCHED
+
+choice SCHED_DEADLINE_MISS_POLICY
+	prompt "Missed scheduling deadline policy"
+	depends on SCHED_DEADLINE_MISS
+	default SCHED_DEADLINE_MISS_PANIC if ASSERT
+	default SCHED_DEADLINE_MISS_COUNT
+	help
+	  What the kernel does when a job released through a deadline event
+	  starts after its start-by deadline, when a scheduler clock event is
+	  delivered later than its deadline plus
+	  CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS, or when admission control finds
+	  a release infeasible. Every failure is counted
+	  (k_deadline_miss_count()).
+
+config SCHED_DEADLINE_MISS_COUNT
+	bool "Count only"
+
+config SCHED_DEADLINE_MISS_PANIC
+	bool "Print a report and panic"
+	help
+	  Intended for debug and test builds.
+
+config SCHED_DEADLINE_MISS_CUSTOM
+	bool "Call k_deadline_miss_handler()"
+	help
+	  The application or a subsystem implements the policy in
+	  k_deadline_miss_handler(), for example to put hardware in a safe
+	  state and stop the work that missed.
+
+endchoice
+
+config SCHED_DEADLINE_MISS_HISTORY
+	int "Job runs kept for missed-deadline reports"
+	depends on SCHED_DEADLINE_MISS
+	default 8
+	range 1 32
+	help
+	  Number of recent deadline-event job runs the kernel keeps, so that a
+	  report can list what ran between a release and its detected miss.
+
 config CLOCK_EVENT
 	bool "Optional absolute clock-event interface"
 	help
@@ -189,16 +231,9 @@ config CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS
 	default 61036
 	help
 	  A clock event delivered more than this after its deadline is a missed
-	  deadline and is counted (k_clock_event_sched_late_count()). The
-	  default is two cycles of a 32768 Hz deep-sleep clock.
-
-config CLOCK_EVENT_SCHED_PANIC_ON_LATE
-	bool "Panic on a missed clock-event deadline"
-	default y if ASSERT
-	help
-	  Treat a clock event delivered later than
-	  CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS after its deadline as a fatal
-	  error. Intended for debug and test builds.
+	  deadline: it is counted (k_clock_event_sched_late_count()) and handed
+	  to SCHED_DEADLINE_MISS_POLICY. The default is two cycles of a
+	  32768 Hz deep-sleep clock.
 
 config CLOCK_EVENT_SCHED_TRACE
 	bool "Trace scheduler clock decisions"

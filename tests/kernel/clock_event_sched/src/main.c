@@ -8,6 +8,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/kernel/clock_event.h>
+#include <zephyr/kernel/deadline_miss.h>
 #include <zephyr/ztest.h>
 
 #define LOGICAL_HZ CONFIG_CLOCK_EVENT_SCHED_FREQUENCY
@@ -153,6 +154,15 @@ static void publish(struct k_clock_event *clock_event, uint32_t generation, void
 	last_published = clock_event;
 }
 
+static struct k_deadline_miss last_miss;
+static unsigned int misses;
+
+void k_deadline_miss_handler(const struct k_deadline_miss *miss)
+{
+	last_miss = *miss;
+	misses++;
+}
+
 static void *setup(void)
 {
 	zassert_ok(k_clock_event_provider_register(&fake_backend, &deep,
@@ -172,6 +182,7 @@ static void before(void *fixture)
 	k_clock_event_cancel(&second);
 	deep.busy = false;
 	publications = 0U;
+	misses = 0U;
 }
 
 ZTEST(clock_event_sched, test_time_follows_the_fast_provider)
@@ -335,6 +346,39 @@ ZTEST(clock_event_sched, test_busy_deep_provider_is_retried_from_active)
 	zassert_equal(publications, 1U);
 	zassert_true(published_at >= deadline, "never delivered early");
 	zassert_true(logical_ns(published_at - deadline) < 2U * NSEC_PER_USEC);
+}
+
+/*
+ * An expiry delivered later than the deadline plus
+ * CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS is a missed deadline: it is counted and
+ * handed to the missed-deadline policy once, after the service released its
+ * lock, naming the clock event and its deadline. An on-time delivery is not.
+ */
+ZTEST(clock_event_sched, test_late_delivery_is_reported)
+{
+	struct fake_slot *a = &active.slots[0];
+	uint64_t now = k_clock_event_sched_now();
+	uint64_t deadline = now + 50U * LOGICAL_HZ / USEC_PER_SEC;
+	uint32_t late_before = k_clock_event_sched_late_count();
+
+	zassert_ok(k_clock_event_arm_abs(&event, (uint32_t)deadline));
+	fake_expire(a);
+	zassert_equal(publications, 1U);
+	zassert_equal(misses, 0U, "an on-time delivery was reported");
+
+	deadline = k_clock_event_sched_now() + 50U * LOGICAL_HZ / USEC_PER_SEC;
+	zassert_ok(k_clock_event_arm_abs(&event, (uint32_t)deadline));
+	/* The provider interrupt is taken twice the tolerance after the deadline. */
+	fake_ns = logical_ns(deadline) + 2U * CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS;
+	fake_expire(a);
+	zassert_equal(publications, 2U, "a late expiry is still delivered");
+	zassert_equal(misses, 1U, "a late delivery was not reported once");
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_DELIVERY);
+	zassert_equal_ptr(last_miss.object, &event);
+	zassert_equal((uint32_t)last_miss.deadline, (uint32_t)deadline);
+	zassert_true(logical_ns((uint32_t)(last_miss.now - (uint32_t)deadline)) >
+		     CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS);
+	zassert_equal(k_clock_event_sched_late_count(), late_before + 1U);
 }
 
 ZTEST_SUITE(clock_event_sched, NULL, setup, before, NULL, NULL);

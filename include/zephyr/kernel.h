@@ -1128,10 +1128,20 @@ struct k_deadline_event {
 	/* Earliest start-by deadline among the coalesced pending publications. */
 	int deadline;
 	bool pending;
+	/* The pending publications released the consumer from its wait. */
+	bool released_idle;
+	/* When the pending publications released the consumer. */
+	uint32_t release;
+	/* Thread that was running at that release. */
+	struct k_thread *released_over;
+	/* Name for missed-deadline reports, or NULL. */
+	const char *name;
 };
 
 /** @cond INTERNAL_HIDDEN */
-#define Z_DEADLINE_EVENT_INITIALIZER { .consumer = NULL, .deadline = 0, .pending = false }
+#define Z_DEADLINE_EVENT_INITIALIZER_NAMED(_name) \
+	{ .consumer = NULL, .deadline = 0, .pending = false, .name = (_name) }
+#define Z_DEADLINE_EVENT_INITIALIZER Z_DEADLINE_EVENT_INITIALIZER_NAMED(NULL)
 /** @endcond */
 
 /**
@@ -1140,7 +1150,7 @@ struct k_deadline_event {
  * @param name Name of the event object.
  */
 #define K_DEADLINE_EVENT_DEFINE(name) \
-	struct k_deadline_event name = Z_DEADLINE_EVENT_INITIALIZER
+	struct k_deadline_event name = Z_DEADLINE_EVENT_INITIALIZER_NAMED(#name)
 
 /**
  * @brief Initialize a deadline event.
@@ -1158,6 +1168,12 @@ __syscall void k_deadline_event_init(struct k_deadline_event *event);
  * remains latched and is consumed by that first wait.  If the consumer is
  * already ready or running, the event remains latched for its next wait,
  * together with the earliest deadline posted since it was last consumed.
+ *
+ * A publication that finds the consumer suspended in its wait releases a
+ * job: if that job starts after @p deadline, the start is reported to
+ * CONFIG_SCHED_DEADLINE_MISS_POLICY (include/zephyr/kernel/deadline_miss.h).
+ * One that arrives while the consumer runs is latched for its next run but
+ * not checked: the run in progress may already serve it.
  *
  * @isr_ok
  *

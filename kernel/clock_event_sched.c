@@ -33,6 +33,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/kernel/clock_event.h>
+#include <zephyr/kernel/deadline_miss.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/pm/pm.h>
 #include <zephyr/pm/policy.h>
@@ -338,6 +339,14 @@ static void hw_cancel(struct k_clock_event *hw, bool *armed)
 static uint32_t late_count;
 /* Which provider's expiry is being serviced ('D', 'A'), for miss reports. */
 static char servicing;
+/* First late delivery found while servicing, reported once sched_lock is released. */
+static struct {
+	const struct k_clock_event *event;
+	uint64_t deadline;
+	uint64_t now;
+	enum sched_stage stage;
+	bool valid;
+} late;
 
 static void check_lateness(const struct sched_client *c, uint64_t now, enum sched_stage stage)
 {
@@ -349,16 +358,45 @@ static void check_lateness(const struct sched_client *c, uint64_t now, enum sche
 		return;
 	}
 	late_count++;
-	if (IS_ENABLED(CONFIG_CLOCK_EVENT_SCHED_PANIC_ON_LATE)) {
-		/* Print synchronously: the report must not depend on deferred logging. */
+	if (!late.valid) {
+		late.event = c->event;
+		late.deadline = c->deadline;
+		late.now = now;
+		late.stage = stage;
+		late.valid = true;
+	}
+}
+
+/* Hand a late delivery to the missed-deadline policy. Caller does not hold sched_lock. */
+static void report_lateness(void)
+{
+	struct k_deadline_miss miss;
+	bool valid = false;
+
+	/* Racy peek: a late delivery is recorded under the lock this ISR just released. */
+	if (!late.valid) {
+		return;
+	}
+	miss = (struct k_deadline_miss){
+		.kind = K_DEADLINE_MISS_DELIVERY,
+	};
+	K_SPINLOCK(&sched_lock) {
+		if (late.valid) {
+			miss.object = late.event;
+			miss.release = (uint32_t)late.deadline;
+			miss.deadline = (int)(uint32_t)late.deadline;
+			miss.now = (uint32_t)late.now;
+			late.valid = false;
+			valid = true;
+		}
+	}
+	if (!valid) {
+		return;
+	}
+	miss.running_at_release = k_current_get();
+	if (IS_ENABLED(CONFIG_SCHED_DEADLINE_MISS_PANIC)) {
+		/* The service's own evidence, printed before the policy panics. */
 		LOG_PANIC();
-		printk("clock event %p delivered %llu ns late (tolerance %u ns): stage %d, "
-		       "servicing %c, deadline %llu now %llu\n",
-		       c->event,
-		       (unsigned long long)((now - c->deadline) * NSEC_PER_SEC / LOGICAL_HZ),
-		       CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS, (int)stage,
-		       servicing ? servicing : '-', (unsigned long long)c->deadline,
-		       (unsigned long long)now);
 		printk("  deep anchor %llu@%u, active anchor %llu@%u, deep armed %d@%u, "
 		       "active armed %d@%u\n",
 		       (unsigned long long)deep_anchor.logical, deep_anchor.count,
@@ -366,8 +404,8 @@ static void check_lateness(const struct sched_client *c, uint64_t now, enum sche
 		       deep_armed.armed, deep_armed.target, active_armed.armed,
 		       active_armed.target);
 		trace_dump();
-		k_panic();
 	}
+	z_deadline_miss_report(&miss);
 }
 
 uint32_t k_clock_event_sched_late_count(void)
@@ -640,6 +678,7 @@ static void hw_expired(struct k_clock_event *event, uint32_t generation, void *u
 		servicing = 0;
 	}
 	deliver(fired, n);
+	report_lateness();
 }
 
 /*

@@ -6,6 +6,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/ztest.h>
 #include <zephyr/random/random.h>
+#include <zephyr/kernel/deadline_miss.h>
 
 #define NUM_THREADS 8
 /* this should be large enough for us
@@ -186,6 +187,58 @@ static void level_run(int outer_prio, int outer_deadline, int inner_prio, int in
 		k_thread_abort(&level_threads[i]);
 	}
 }
+
+/* Missed deadlines reported through the custom policy. */
+static struct k_deadline_miss last_miss;
+static volatile int misses;
+
+void k_deadline_miss_handler(const struct k_deadline_miss *miss)
+{
+	last_miss = *miss;
+	misses++;
+}
+
+K_DEADLINE_EVENT_DEFINE(miss_event);
+K_SEM_DEFINE(miss_armed, 0, 1);
+struct k_thread miss_thread;
+K_THREAD_STACK_DEFINE(miss_stack, STACK_SIZE);
+volatile int miss_runs;
+volatile bool miss_relatch;
+
+/* Consumer below the test thread: a release runs once the test thread blocks. */
+static void miss_worker(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	k_sem_give(&miss_armed);
+	for (;;) {
+		k_deadline_event_wait(&miss_event);
+		miss_runs++;
+		if (miss_relatch) {
+			miss_relatch = false;
+			/* Latched while running: an ordering key only, never checked. */
+			k_deadline_event_post(&miss_event, K_DEADLINE(0));
+			k_busy_wait(2000);
+		}
+	}
+}
+
+static void miss_start_consumer(void)
+{
+	misses = 0;
+	miss_runs = 0;
+	miss_relatch = false;
+	k_deadline_event_init(&miss_event);
+	k_sem_reset(&miss_armed);
+	(void)k_thread_create(&miss_thread, miss_stack, STACK_SIZE, miss_worker, NULL, NULL,
+			      NULL, K_LOWEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
+	k_sem_take(&miss_armed, K_FOREVER);
+	/* Let the consumer reach its wait. */
+	k_sleep(K_MSEC(1));
+}
+
 
 static void event_latch_post_twice(const void *param)
 {
@@ -538,6 +591,61 @@ ZTEST(suite_deadline, test_deadline_event_metairq_same_level_cooperative)
 	zassert_mem_equal(level_order, "oOi", 3,
 			  "a later deadline preempted within a meta-IRQ level");
 }
+
+/**
+ * @brief Verify a job released from idle that starts late is reported.
+ *
+ * The test thread releases a lower-priority consumer with a 1 ms start-by
+ * deadline, then keeps the CPU for 3 ms. The consumer starts after its
+ * deadline, and the custom policy receives one late-start report naming the
+ * event, its deadline, its release and the thread that ran at the release.
+ */
+ZTEST(suite_deadline, test_deadline_event_late_start_is_reported)
+{
+	int deadline;
+	uint32_t before;
+
+	miss_start_consumer();
+	before = k_cycle_get_32();
+	deadline = K_DEADLINE(MSEC_TO_CYCLES(1));
+	k_deadline_event_post(&miss_event, deadline);
+	k_busy_wait(3000);
+	k_sleep(K_MSEC(1));
+
+	zassert_equal(miss_runs, 1, "released consumer did not run once");
+	zassert_equal(misses, 1, "late start was not reported once");
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_START);
+	zassert_equal_ptr(last_miss.object, &miss_event);
+	zassert_str_equal(last_miss.name, "miss_event");
+	zassert_equal_ptr(last_miss.thread, &miss_thread);
+	zassert_equal(last_miss.deadline, deadline);
+	zassert_true((int32_t)(last_miss.release - before) >= 0, "release precedes the post");
+	zassert_true((int32_t)(last_miss.now - (uint32_t)deadline) > 0, "not late");
+	zassert_equal_ptr(last_miss.running_at_release, k_current_get(),
+			  "report does not name the thread that ran instead");
+	k_thread_abort(&miss_thread);
+}
+
+/**
+ * @brief Verify an on-time start and a run latched while busy are not reported.
+ *
+ * A release from idle that starts within its deadline is not a miss. A
+ * publication the consumer posts while it runs is latched: it orders the next
+ * run, which starts 2 ms after that publication's deadline, but it belongs to
+ * the busy period that may already serve it, so it is not checked.
+ */
+ZTEST(suite_deadline, test_deadline_event_on_time_and_latched_not_reported)
+{
+	miss_start_consumer();
+	miss_relatch = true;
+	k_deadline_event_post(&miss_event, K_DEADLINE(MSEC_TO_CYCLES(10)));
+	k_sleep(K_MSEC(10));
+
+	zassert_equal(miss_runs, 2, "latched run did not happen");
+	zassert_equal(misses, 0, "an on-time or latched run was reported");
+	k_thread_abort(&miss_thread);
+}
+
 
 void worker(void *p1, void *p2, void *p3)
 {
