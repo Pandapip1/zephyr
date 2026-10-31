@@ -37,6 +37,8 @@ struct fake_provider {
 	uint32_t min_lead;
 	struct fake_slot slots[CONFIG_CLOCK_EVENT_SCHED_CLIENTS];
 	size_t used;
+	/* Still applying an earlier arm, like an LF-synchronized compare register. */
+	bool busy;
 };
 
 static struct fake_provider deep = {.provider = &deep, .hz = DEEP_HZ, .min_lead = DEEP_MIN};
@@ -87,6 +89,9 @@ static int fake_arm_abs(void *context, uint32_t deadline, uint32_t generation)
 	if ((int32_t)(deadline - cycles_at(slot->provider, fake_ns)) <
 	    (int32_t)slot->provider->min_lead) {
 		return -ETIME;
+	}
+	if (slot->provider->busy) {
+		return -EBUSY;
 	}
 	slot->deadline = deadline;
 	slot->generation = generation;
@@ -165,6 +170,7 @@ static void before(void *fixture)
 	ARG_UNUSED(fixture);
 	k_clock_event_cancel(&event);
 	k_clock_event_cancel(&second);
+	deep.busy = false;
 	publications = 0U;
 }
 
@@ -293,6 +299,42 @@ ZTEST(clock_event_sched, test_arm_inside_provider_lead_is_delivered_once)
 	fake_expire(a);
 	zassert_equal(publications, 1U);
 	zassert_true((int32_t)((uint32_t)published_at - deadline) >= 0, "never delivered early");
+}
+
+/*
+ * A deep provider still synchronizing an earlier compare write refuses a new
+ * arm with -EBUSY rather than spin with interrupts locked. The active provider
+ * stands in until the deep one accepts the arm again, within its lead, and the
+ * client is still woken on the deep provider and delivered on time.
+ */
+ZTEST(clock_event_sched, test_busy_deep_provider_is_retried_from_active)
+{
+	struct fake_slot *d = &deep.slots[0];
+	struct fake_slot *a = &active.slots[0];
+	uint64_t now = k_clock_event_sched_now();
+	uint64_t deadline = now + 100U * (LOGICAL_HZ / DEEP_HZ);
+	uint64_t retry_by = now + (DEEP_MIN + 2U) * (LOGICAL_HZ / DEEP_HZ);
+
+	deep.busy = true;
+	zassert_ok(k_clock_event_arm_abs(&event, (uint32_t)deadline));
+	zassert_false(d->armed, "a busy deep provider takes no arm");
+	zassert_true(a->armed, "the active provider stands in");
+	zassert_true(ns_at(&active, a->deadline) <= logical_ns(retry_by),
+		     "the stand-in retries within the deep provider's lead");
+
+	deep.busy = false;
+	fake_expire(a);
+	zassert_equal(publications, 0U, "the retry is not the deadline");
+	zassert_true(d->armed, "the deep arm is retried once the provider accepts it");
+	zassert_false(a->armed, "no stand-in once the deep provider is armed");
+
+	fake_expire(d);
+	zassert_equal(publications, 0U);
+	zassert_true(a->armed);
+	fake_expire(a);
+	zassert_equal(publications, 1U);
+	zassert_true(published_at >= deadline, "never delivered early");
+	zassert_true(logical_ns(published_at - deadline) < 2U * NSEC_PER_USEC);
 }
 
 ZTEST_SUITE(clock_event_sched, NULL, setup, before, NULL, NULL);

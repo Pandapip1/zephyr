@@ -73,7 +73,10 @@ struct k_clock_event_backend {
 	 * Arm @p generation for an absolute deadline.
 	 *
 	 * Return -ETIME when the provider cannot arm reliably because the target is
-	 * too close or already past. The provider's eventual IRQ must call
+	 * too close or already past. Return -EBUSY, leaving the event unarmed, when
+	 * the hardware is still applying an earlier arm and cannot take this one
+	 * without waiting for it; the provider must accept an arm again within
+	 * its minimum lead. The provider's eventual IRQ must call
 	 * k_clock_event_fire() with this generation.
 	 */
 	int (*arm_abs)(void *context, uint32_t deadline, uint32_t generation);

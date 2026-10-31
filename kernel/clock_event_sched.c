@@ -413,8 +413,10 @@ static void arm_asap_locked(void)
 	    (int32_t)(deep_armed.target - provider_now(deep_provider)) <= (int32_t)(deep_min + 1U)) {
 		return;
 	}
-	(void)hw_arm(&deep_hw, provider_now(deep_provider) + deep_min + 1U,
-		     &deep_armed.target, &deep_armed.armed);
+	/* -EBUSY: the deep provider accepts an arm again within its lead. */
+	while (hw_arm(&deep_hw, provider_now(deep_provider) + deep_min + 1U, &deep_armed.target,
+		      &deep_armed.armed) == -EBUSY) {
+	}
 }
 
 /*
@@ -468,38 +470,65 @@ static size_t service_locked(struct fired *out)
 			return n;
 		}
 
+		/* The active provider's target: its earliest client, or a deep stand-in. */
+		struct sched_client *active_for = active_next;
+		uint64_t active_target = (active_next != NULL) ? active_next->deadline : 0U;
+		bool deep_deferred = false;
+
 		if (deep_next == NULL) {
 			hw_cancel(&deep_hw, &deep_armed.armed);
-		} else if (hw_arm(&deep_hw, to_deep(deep_next->wake_at), &deep_armed.target,
-				  &deep_armed.armed) != 0) {
-			/* Inside the deep floor: hand it to the active provider. */
-			if (active_bound) {
-				deep_next->stage = STAGE_ACTIVE;
+		} else {
+			int ret = hw_arm(&deep_hw, to_deep(deep_next->wake_at), &deep_armed.target,
+					 &deep_armed.armed);
+
+			if (ret == -EBUSY && active_bound) {
+				/*
+				 * The deep provider is still applying an earlier arm and
+				 * accepts a new one within its minimum lead. Until then the
+				 * active provider stands in, for the wake or for the retry,
+				 * whichever is first, and deep sleep stays locked: no deep
+				 * compare would end it. The client remains a deep one.
+				 */
+				uint64_t retry = MIN(deep_next->wake_at, now + deep_floor);
+
+				deep_deferred = true;
+				if (active_for == NULL || retry < active_target) {
+					active_for = deep_next;
+					active_target = retry;
+				}
+			} else if (ret == -EBUSY) {
+				/* Nothing else can wake it: retry, bounded by the deep lead. */
+				continue;
+			} else if (ret != 0) {
+				/* Inside the deep floor: hand it to the active provider. */
+				if (active_bound) {
+					deep_next->stage = STAGE_ACTIVE;
+					continue;
+				}
+				if (out == NULL) {
+					arm_asap_locked();
+					return n;
+				}
+				/* Without one, the deadline is closer than any provider can arm. */
+				while (now_locked() < deep_next->deadline) {
+				}
 				continue;
 			}
-			if (out == NULL) {
-				arm_asap_locked();
-				return n;
-			}
-			/* Without one, the deadline is closer than any provider can arm. */
-			while (now_locked() < deep_next->deadline) {
-			}
-			continue;
 		}
 
-		pm_lock_set(active_next != NULL);
-		if (active_next == NULL) {
+		pm_lock_set(active_next != NULL || deep_deferred);
+		if (active_for == NULL) {
 			if (active_bound) {
 				hw_cancel(&active_hw, &active_armed.armed);
 			}
-		} else if (hw_arm(&active_hw, to_active(active_next->deadline), &active_armed.target,
+		} else if (hw_arm(&active_hw, to_active(active_target), &active_armed.target,
 				  &active_armed.armed) != 0) {
 			if (out == NULL) {
 				arm_asap_locked();
 				return n;
 			}
 			/* Closer than the active provider's lead: wait it out, never early. */
-			while (now_locked() < active_next->deadline) {
+			while (now_locked() < active_target) {
 			}
 			continue;
 		}
