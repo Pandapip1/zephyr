@@ -1,0 +1,502 @@
+/*
+ * Copyright The Zephyr Project Contributors
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
+ * Admission control for deadline events.
+ *
+ * Every deadline event with a budget (its worst-case execution time per run)
+ * is a job source. A release is checked before it runs: the scheduler's own
+ * policy is simulated over the work it already holds, and the release is
+ * feasible when every job not yet started can still start by its start-by
+ * deadline. The simulation is exact for that policy:
+ *
+ * - A ready thread of higher priority preempts a lower one.
+ * - Within one priority, the earliest deadline goes first; a running
+ *   cooperative thread (meta-IRQ ones included) is not preempted by its own
+ *   priority, a preemptible one is.
+ * - A run started by k_deadline_event_post_at() occupies its thread from
+ *   dispatch until its not-before instant, then runs its budget.
+ *
+ * The job set is: the run in progress (its budget less the time since it
+ * started, or its whole budget if another thread preempted it), released runs
+ * not yet started, admitted timed releases not yet posted, and the work being
+ * admitted. Work outside admission control is bounded by one blocking term,
+ * CONFIG_SCHED_DEADLINE_ADMISSION_BLOCKING_NS, taken at the start of the
+ * check: a lower-priority section with interrupts or the scheduler locked,
+ * and interrupt handling.
+ *
+ * When some job would start late, the job reported is the one the policy
+ * sacrifices: the lowest priority among the late ones, and of those the
+ * latest deadline. A high-priority job is never declared infeasible to make
+ * room for a lower one.
+ */
+
+#include <zephyr/kernel.h>
+#include <zephyr/kernel/deadline_miss.h>
+#include <zephyr/kernel/deferred_release.h>
+#include <zephyr/sys/slist.h>
+#include <limits.h>
+#include <kthread.h>
+#include <ksched.h>
+#include <deadline_admission.h>
+
+#define BLOCKING_CYCLES \
+	((uint32_t)k_ns_to_cyc_ceil64(CONFIG_SCHED_DEADLINE_ADMISSION_BLOCKING_NS))
+
+enum {
+	ADMIT_IDLE,
+	/* Released and not yet started. */
+	ADMIT_PENDING,
+	/* Between the wait that started a run and the next wait. */
+	ADMIT_RUNNING,
+};
+
+static sys_slist_t admitted;
+
+struct sim_job {
+	struct k_deadline_event *event;
+	/* Times relative to the check, in cycles. */
+	int32_t release;
+	int32_t not_before;
+	int32_t deadline;
+	uint32_t remaining;
+	/* Work the job brings, for reports. */
+	uint32_t work;
+	int prio;
+	bool started;
+	bool cooperative;
+	bool late;
+};
+
+struct sim {
+	struct sim_job jobs[CONFIG_SCHED_DEADLINE_ADMISSION_JOBS];
+	size_t count;
+	/* Index of the job running when the check starts, or -1. */
+	int running;
+	/* CPU unavailable to every job from the start of the check. */
+	int32_t blocking;
+};
+
+static int32_t rel(uint32_t t, uint32_t now)
+{
+	return (int32_t)(t - now);
+}
+
+static struct sim_job *sim_add(struct sim *s)
+{
+	if (s->count == ARRAY_SIZE(s->jobs)) {
+		return NULL;
+	}
+	s->jobs[s->count] = (struct sim_job){0};
+	return &s->jobs[s->count++];
+}
+
+/* @p a runs before @p b when both are ready and neither is running. */
+static bool sim_before(const struct sim_job *a, const struct sim_job *b)
+{
+	if (a->prio != b->prio) {
+		return a->prio < b->prio;
+	}
+	return (int32_t)(a->deadline - b->deadline) < 0;
+}
+
+/*
+ * Run the scheduler's policy over the job set from time 0 and mark every job
+ * that starts after its deadline. Returns true when none does.
+ */
+static bool sim_run(struct sim *s)
+{
+	int32_t t = s->blocking;
+	int current = s->running;
+	bool ok = true;
+
+	/* Each step finishes a job or reaches a release: bounded by twice the jobs. */
+	for (size_t step = 0U; step < 2U * ARRAY_SIZE(s->jobs) + 2U; step++) {
+		int best = -1;
+		int32_t next_release = INT32_MAX;
+
+		for (size_t i = 0U; i < s->count; i++) {
+			struct sim_job *j = &s->jobs[i];
+
+			if (j->remaining == 0U) {
+				continue;
+			}
+			if (j->release > t) {
+				next_release = MIN(next_release, j->release);
+				continue;
+			}
+			if (best < 0 || sim_before(j, &s->jobs[best])) {
+				best = (int)i;
+			}
+		}
+		/* A running cooperative job keeps the CPU against its own priority. */
+		if (current >= 0 && s->jobs[current].remaining != 0U && best >= 0 &&
+		    best != current && s->jobs[current].cooperative &&
+		    s->jobs[best].prio >= s->jobs[current].prio) {
+			best = current;
+		}
+		if (best < 0) {
+			if (next_release == INT32_MAX) {
+				break;
+			}
+			t = next_release;
+			continue;
+		}
+
+		struct sim_job *j = &s->jobs[best];
+
+		if (!j->started) {
+			int32_t start = MAX(t, j->not_before);
+
+			j->started = true;
+			/* Dispatched early, it spins at its priority until its not-before. */
+			j->remaining += (uint32_t)(start - t);
+			if (start - j->deadline > 0) {
+				j->late = true;
+				ok = false;
+			}
+		}
+		current = best;
+
+		int32_t run = (int32_t)MIN((uint64_t)j->remaining, (uint64_t)INT32_MAX);
+
+		if (next_release != INT32_MAX && next_release - t < run) {
+			run = next_release - t;
+		}
+		j->remaining -= (uint32_t)run;
+		t += run;
+	}
+	return ok;
+}
+
+/* Fill @p s with the admitted job set at @p now. Caller holds the scheduler lock. */
+static void sim_collect(struct sim *s, uint32_t now)
+{
+	struct k_deadline_event *event;
+
+	s->count = 0U;
+	s->running = -1;
+
+	/* Lower-priority non-preemptible sections and interrupts: ahead of everything. */
+	s->blocking = (int32_t)BLOCKING_CYCLES;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&admitted, event, admission_node) {
+		struct k_thread *consumer = event->consumer;
+		struct sim_job *j;
+
+		if (consumer == NULL) {
+			continue;
+		}
+		if (event->admission_state == ADMIT_RUNNING) {
+			j = sim_add(s);
+			if (j == NULL) {
+				break;
+			}
+			j->started = true;
+			j->remaining = event->budget;
+			if (consumer == _current) {
+				uint32_t elapsed = now - event->run_start;
+
+				j->remaining = (elapsed < event->budget) ?
+					       event->budget - elapsed : 0U;
+				if (s->running < 0) {
+					s->running = (int)(j - s->jobs);
+				}
+			}
+			j->deadline = rel((uint32_t)consumer->base.prio_deadline, now);
+			j->work = event->budget;
+			if (event->pending) {
+				/* A run latched behind this one. */
+				struct sim_job *next = sim_add(s);
+
+				if (next != NULL) {
+					*next = (struct sim_job){
+						.event = event,
+						.deadline = rel((uint32_t)event->deadline, now),
+						.remaining = event->budget,
+						.work = event->budget,
+						.prio = consumer->base.prio,
+						.cooperative = consumer->base.prio < 0,
+					};
+				}
+			}
+		} else if (event->admission_state == ADMIT_PENDING) {
+			j = sim_add(s);
+			if (j == NULL) {
+				break;
+			}
+			j->remaining = event->budget;
+			j->deadline = rel((uint32_t)event->deadline, now);
+			j->not_before = event->has_not_before ?
+					 MAX(0, rel(event->not_before, now)) : 0;
+			j->work = event->budget;
+		} else {
+			j = NULL;
+		}
+		if (j != NULL) {
+			j->event = event;
+			j->prio = consumer->base.prio;
+			j->cooperative = consumer->base.prio < 0;
+		}
+		if (event->future) {
+			j = sim_add(s);
+			if (j == NULL) {
+				break;
+			}
+			j->event = event;
+			j->remaining = event->budget;
+			j->release = MAX(0, rel(event->future_release, now));
+			j->work = event->budget;
+			j->not_before = j->release;
+			j->deadline = rel((uint32_t)event->future_deadline, now);
+			j->prio = consumer->base.prio;
+			j->cooperative = consumer->base.prio < 0;
+		}
+	}
+}
+
+/* The late job priority sacrifices: lowest priority, then latest deadline. */
+static const struct sim_job *sim_victim(const struct sim *s)
+{
+	const struct sim_job *victim = NULL;
+
+	for (size_t i = 0U; i < s->count; i++) {
+		const struct sim_job *j = &s->jobs[i];
+
+		if (!j->late) {
+			continue;
+		}
+		if (victim == NULL || j->prio > victim->prio ||
+		    (j->prio == victim->prio && j->deadline - victim->deadline > 0)) {
+			victim = j;
+		}
+	}
+	return victim;
+}
+
+/* Work ahead of @p victim: everything that ran before its start in the simulation. */
+static uint32_t sim_demand(const struct sim *s, const struct sim_job *victim)
+{
+	uint32_t demand = (uint32_t)s->blocking;
+
+	for (size_t i = 0U; i < s->count; i++) {
+		const struct sim_job *j = &s->jobs[i];
+
+		bool ahead = (j->prio < victim->prio) ||
+			     (j->prio == victim->prio && j->deadline - victim->deadline <= 0);
+
+		if (j != victim && ahead) {
+			demand += j->work;
+		}
+	}
+	return demand;
+}
+
+/* Run the check over the current job set plus @p extra. Caller holds the scheduler lock. */
+static bool admission_check(uint32_t now, const struct sim_job *extra,
+			    struct admission_verdict *verdict)
+{
+	/* One check at a time: the simulation state is too large for small stacks. */
+	static struct sim s;
+	const struct sim_job *victim;
+
+	sim_collect(&s, now);
+	if (extra != NULL) {
+		struct sim_job *j = sim_add(&s);
+
+		if (j != NULL) {
+			*j = *extra;
+		}
+	}
+	if (sim_run(&s)) {
+		return true;
+	}
+	victim = sim_victim(&s);
+	verdict->victim = victim->event;
+	verdict->now = now;
+	verdict->release = now + (uint32_t)victim->release;
+	verdict->deadline = (int)(now + (uint32_t)victim->deadline);
+	verdict->demand = sim_demand(&s, victim);
+	return false;
+}
+
+static void admission_report(const struct admission_verdict *verdict, struct k_thread *running)
+{
+	struct k_deadline_miss miss = {
+		.kind = K_DEADLINE_MISS_UNSAT,
+		.object = verdict->victim,
+		.name = (verdict->victim != NULL) ? verdict->victim->name : NULL,
+		.thread = (verdict->victim != NULL) ? verdict->victim->consumer : NULL,
+		.release = verdict->release,
+		.deadline = verdict->deadline,
+		.now = verdict->now,
+		.running_at_release = running,
+		.demand = verdict->demand,
+	};
+
+	z_deadline_miss_report(&miss);
+}
+
+void k_deadline_event_budget_set(struct k_deadline_event *event, uint32_t budget)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	if (event->budget == 0U && budget != 0U) {
+		sys_slist_append(&admitted, &event->admission_node);
+	} else if (event->budget != 0U && budget == 0U) {
+		(void)sys_slist_find_and_remove(&admitted, &event->admission_node);
+	}
+	event->budget = budget;
+	z_sched_spinlock_unlock(key);
+}
+
+/*
+ * A publication of @p event at @p now has been recorded; @p idle when it
+ * released the consumer. Caller holds the scheduler lock. Returns false with
+ * @p verdict filled when the release makes the job set infeasible.
+ */
+bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint32_t now,
+				 struct admission_verdict *verdict)
+{
+	if (event->budget == 0U) {
+		return true;
+	}
+	/* A timed release admitted when it was armed is now this publication. */
+	bool armed = event->future;
+
+	event->future = false;
+	if (event->admission_state == ADMIT_RUNNING) {
+		/* Latched for the next run: served by, or queued behind, the run in progress. */
+		return true;
+	}
+	event->admission_state = ADMIT_PENDING;
+	if (!idle || armed) {
+		return true;
+	}
+	return admission_check(now, NULL, verdict);
+}
+
+void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now)
+{
+	if (event->budget != 0U) {
+		event->run_start = now;
+		event->admission_state = ADMIT_RUNNING;
+	}
+}
+
+void z_deadline_admission_finished(struct k_deadline_event *event)
+{
+	if (event->budget != 0U) {
+		event->admission_state = event->pending ? ADMIT_PENDING : ADMIT_IDLE;
+	}
+}
+
+void z_deadline_admission_reset(struct k_deadline_event *event)
+{
+	if (event->budget != 0U && event->admission_state == ADMIT_PENDING) {
+		event->admission_state = ADMIT_IDLE;
+	}
+}
+
+void z_deadline_admission_report(const struct admission_verdict *verdict)
+{
+	admission_report(verdict, k_current_get());
+}
+
+int k_deadline_event_admit(struct k_deadline_event *event, uint32_t release, uint32_t not_before,
+			   int deadline)
+{
+	uint32_t now = k_cycle_get_32();
+	struct admission_verdict verdict;
+	bool ok = true;
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	if (event->budget != 0U && event->consumer != NULL) {
+		event->future = false;
+		event->future_release = release;
+		event->future_deadline = deadline;
+		ok = admission_check(now,
+				     &(struct sim_job){
+					     .event = event,
+					     .release = MAX(0, rel(release, now)),
+					     .not_before = MAX(0, rel(not_before, now)),
+					     .deadline = rel((uint32_t)deadline, now),
+					     .remaining = event->budget,
+					     .work = event->budget,
+					     .prio = event->consumer->base.prio,
+					     .cooperative = event->consumer->base.prio < 0,
+				     },
+				     &verdict);
+		/* Admitted or not, it is armed: later checks must see it. */
+		event->future = true;
+	}
+	z_sched_spinlock_unlock(key);
+	if (!ok) {
+		admission_report(&verdict, k_current_get());
+		return -ETIME;
+	}
+	return 0;
+}
+
+void k_deadline_event_admit_cancel(struct k_deadline_event *event)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	event->future = false;
+	z_sched_spinlock_unlock(key);
+}
+
+int k_deadline_demand_admit(int prio, uint32_t cycles)
+{
+	uint32_t now = k_cycle_get_32();
+	struct admission_verdict verdict;
+	bool ok;
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	ok = admission_check(now,
+			     &(struct sim_job){
+				     .release = 0,
+				     .deadline = INT32_MAX,
+				     .remaining = cycles,
+				     .work = cycles,
+				     .prio = prio,
+				     .cooperative = true,
+			     },
+			     &verdict);
+	z_sched_spinlock_unlock(key);
+	if (!ok) {
+		admission_report(&verdict, k_current_get());
+		return -ETIME;
+	}
+	return 0;
+}
+
+#ifdef CONFIG_CLOCK_EVENT_SCHED
+int k_deadline_event_admit_plan(struct k_deadline_event *event,
+				const struct k_clock_event_sched_plan *plan, uint32_t arm_at,
+				uint32_t not_before, int deadline)
+{
+	/* Arriving late by the rung's granularity delays the start as much. */
+	uint32_t late = (uint32_t)plan->deliver_by - arm_at;
+	int ret = 0;
+
+	if (plan->caller_spin != 0U) {
+		int prio = k_is_in_isr() ? INT_MIN : k_thread_priority_get(k_current_get());
+
+		if (k_deadline_demand_admit(prio, (uint32_t)plan->caller_spin) != 0) {
+			ret = -ETIME;
+		}
+	}
+	if (plan->isr_spin != 0U &&
+	    k_deadline_demand_admit(INT_MIN, (uint32_t)plan->isr_spin) != 0) {
+		ret = -ETIME;
+	}
+	if (k_deadline_event_admit(event, arm_at, not_before + late, deadline) != 0) {
+		ret = -ETIME;
+	}
+	return ret;
+}
+#endif

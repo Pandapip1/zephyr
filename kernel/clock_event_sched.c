@@ -408,6 +408,79 @@ static void report_lateness(void)
 	z_deadline_miss_report(&miss);
 }
 
+#ifdef CONFIG_ZTEST
+/* Tests stop the active clock, as a power state deeper than runtime idle does. */
+static bool active_stopped_for_test;
+
+void z_clock_event_sched_test_active_stopped(bool stopped)
+{
+	active_stopped_for_test = stopped;
+}
+#else
+#define active_stopped_for_test false
+#endif
+
+/* The active provider's clock runs now. Caller holds sched_lock. */
+static bool active_running_locked(void)
+{
+	return active_bound && on_active && !active_stopped_for_test;
+}
+
+/* Logical time of a provider count near its anchor. */
+static uint64_t logical_at(const struct anchor *a, struct scale s, uint32_t count)
+{
+	return a->logical + scale_apply(s, count - a->count);
+}
+
+int k_clock_event_sched_plan(uint64_t target, struct k_clock_event_sched_plan *plan)
+{
+	int ret = 0;
+
+	K_SPINLOCK(&sched_lock) {
+		if (deep_provider == NULL) {
+			ret = -ENODEV;
+			K_SPINLOCK_BREAK;
+		}
+
+		uint64_t now = now_locked();
+		uint64_t lead = (target > now) ? target - now : 0U;
+		uint64_t deep_cycle = convert_ceil(1U, deep_hz, LOGICAL_HZ);
+		bool running = active_running_locked();
+		uint64_t armed = UINT64_MAX;
+
+		*plan = (struct k_clock_event_sched_plan){0};
+		if (deep_armed.armed) {
+			armed = logical_at(&deep_anchor, deep_scale, deep_armed.target);
+		}
+		if (running && active_armed.armed) {
+			armed = MIN(armed, logical_at(&active_anchor, active_scale,
+						      active_armed.target));
+		}
+
+		if (lead >= deep_floor + (active_bound ? wake_budget : 0U)) {
+			/* Deep wake early by the active clock's start-up, which then finishes. */
+			plan->rung = K_CLOCK_EVENT_SCHED_DEEP;
+			plan->deliver_by = target + (active_bound ? 0U : 2U * deep_cycle);
+		} else if (running && lead >= client_min) {
+			plan->rung = K_CLOCK_EVENT_SCHED_ACTIVE;
+			plan->deliver_by = target;
+		} else if (armed > now && armed <= target) {
+			plan->rung = K_CLOCK_EVENT_SCHED_ARMED;
+			plan->deliver_by = target;
+			plan->isr_spin = target - armed;
+		} else {
+			/* Logical time advances from the active clock while it runs. */
+			plan->rung = K_CLOCK_EVENT_SCHED_SPIN;
+			plan->caller_spin = lead;
+			uint64_t step = running ? convert_ceil(1U, active_hz, LOGICAL_HZ)
+						: deep_cycle;
+
+			plan->deliver_by = target + step;
+		}
+	}
+	return ret;
+}
+
 uint32_t k_clock_event_sched_late_count(void)
 {
 	return late_count;
@@ -655,6 +728,11 @@ static const struct k_clock_event_backend sched_backend = {
 	.cancel = sched_cancel,
 	.frequency_hz = sched_frequency_hz,
 };
+
+bool z_clock_event_is_sched(const struct k_clock_event *event)
+{
+	return event->backend == &sched_backend;
+}
 
 static void hw_expired(struct k_clock_event *event, uint32_t generation, void *user_data)
 {

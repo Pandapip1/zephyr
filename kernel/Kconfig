@@ -179,6 +179,45 @@ config SCHED_DEADLINE_MISS_HISTORY
 	  Number of recent deadline-event job runs the kernel keeps, so that a
 	  report can list what ran between a release and its detected miss.
 
+config SCHED_DEADLINE_ADMISSION
+	bool "Admission control for deadline events"
+	depends on SCHED_DEADLINE
+	help
+	  Check every release of a deadline event that has a budget
+	  (k_deadline_event_budget_set()) for feasibility before it runs:
+	  simulate the scheduler's policy over the admitted work and report a
+	  job that could not start by its deadline to
+	  SCHED_DEADLINE_MISS_POLICY as K_DEADLINE_MISS_UNSAT. Timed releases
+	  are admitted when armed (k_deadline_event_admit()).
+
+config SCHED_DEADLINE_ADMISSION_BLOCKING_NS
+	int "Blocking ahead of every admitted job (ns)"
+	depends on SCHED_DEADLINE_ADMISSION
+	default 0
+	help
+	  Longest time work outside admission control can keep any released
+	  job from running: a section of lower priority with interrupts or the
+	  scheduler locked, and interrupt handling. Taken once at the start of
+	  every check.
+
+config SCHED_DEADLINE_ADMISSION_JOBS
+	int "Jobs in one admission check"
+	depends on SCHED_DEADLINE_ADMISSION
+	default 12
+	range 2 64
+	help
+	  Largest number of admitted runs, pending, running or armed, one
+	  check considers. Work beyond it is not counted.
+
+config SCHED_DEADLINE_STATS
+	bool "Record the longest run and start latency of each deadline event"
+	depends on SCHED_DEADLINE
+	help
+	  Keep, per deadline event, the longest run (from the wait that
+	  starts it to the next wait) and the longest delay from a release
+	  from idle to its start (k_deadline_event_stats_get()), for measuring
+	  execution-time budgets on the target. Adds two clock reads per run.
+
 config CLOCK_EVENT
 	bool "Optional absolute clock-event interface"
 	help

@@ -18,6 +18,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/kernel/deadline_miss.h>
+#include <deadline_admission.h>
 #include <kspinlock.h>
 #include <ksched.h>
 #include <run_q.h>
@@ -38,14 +39,18 @@ void z_impl_k_deadline_event_init(struct k_deadline_event *event)
 	z_sched_spinlock_unlock(key);
 }
 
-void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
+/* Record a publication; @p not_before is valid when @p has_not_before. */
+static void deadline_event_post(struct k_deadline_event *event, bool has_not_before,
+				uint32_t not_before, int deadline)
 {
 	/* Read the clock outside the scheduler lock: it may take a lock of its own. */
 	uint32_t now = k_cycle_get_32();
+	struct admission_verdict verdict;
 	k_spinlock_key_t key = z_sched_spinlock_lock();
 	struct k_thread *thread = event->consumer;
 	bool idle = (thread != NULL) && z_is_thread_suspended(thread) &&
 		    ((thread->base.thread_state & ~_THREAD_SUSPENDED) == 0U);
+	bool feasible;
 
 	/*
 	 * Never count publications, but keep the earliest deadline among those
@@ -64,6 +69,14 @@ void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
 		event->released_idle = idle;
 		event->release = now;
 		event->released_over = _current;
+		event->has_not_before = has_not_before;
+		event->not_before = not_before;
+	} else if (!has_not_before) {
+		/* Coalesced with work due now: no not-before bound remains. */
+		event->has_not_before = false;
+	} else if (event->has_not_before &&
+		   (int32_t)(not_before - event->not_before) < 0) {
+		event->not_before = not_before;
 	}
 	event->pending = true;
 	if (idle) {
@@ -71,10 +84,28 @@ void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
 		thread->base.prio_deadline = event->deadline;
 		z_mark_thread_as_not_suspended(thread);
 		z_sched_ready_locked(thread);
+	}
+	feasible = z_deadline_admission_posted(event, idle, now, &verdict);
+	if (!feasible) {
+		/* Report before the released consumer can run. */
+		z_sched_spinlock_unlock(key);
+		z_deadline_admission_report(&verdict);
+		z_reschedule_unlocked();
+	} else if (idle) {
 		z_reschedule_locked(key);
 	} else {
 		z_sched_spinlock_unlock(key);
 	}
+}
+
+void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
+{
+	deadline_event_post(event, false, 0U, deadline);
+}
+
+void k_deadline_event_post_at(struct k_deadline_event *event, uint32_t not_before, int deadline)
+{
+	deadline_event_post(event, true, not_before, deadline);
 }
 
 void z_impl_k_deadline_event_reset(struct k_deadline_event *event)
@@ -83,17 +114,39 @@ void z_impl_k_deadline_event_reset(struct k_deadline_event *event)
 
 	/* Do not alter consumer scheduling state: only discard an unread event. */
 	event->pending = false;
+	z_deadline_admission_reset(event);
 	z_sched_spinlock_unlock(key);
 }
 
-/* Check the start of a run released from idle against its deadline. */
-static void deadline_event_started(struct k_deadline_event *event, int deadline,
+/*
+ * Start a run: wait out its not-before bound, then check a run released from
+ * idle against its deadline.
+ */
+static uint32_t deadline_event_started(struct k_deadline_event *event, int deadline,
 				   bool released_idle, uint32_t release,
-				   struct k_thread *released_over)
+				   struct k_thread *released_over, bool has_not_before,
+				   uint32_t not_before)
 {
 	uint32_t now = k_cycle_get_32();
 
+	/* Bounded by the release lead its poster chose; the spin is this job's own demand. */
+	while (has_not_before && (int32_t)(now - not_before) < 0) {
+		uint32_t us = k_cyc_to_us_floor32(not_before - now);
+
+		/* Whole microseconds as a busy wait, so simulated time advances too. */
+		if (us != 0U) {
+			k_busy_wait(us);
+		} else {
+			arch_nop();
+		}
+		now = k_cycle_get_32();
+	}
 	z_deadline_miss_job_start(event, now);
+#ifdef CONFIG_SCHED_DEADLINE_STATS
+	if (released_idle && now - release > event->max_latency) {
+		event->max_latency = now - release;
+	}
+#endif
 	if (released_idle && (int32_t)(now - (uint32_t)deadline) > 0) {
 		struct k_deadline_miss miss = {
 			.kind = K_DEADLINE_MISS_START,
@@ -108,6 +161,7 @@ static void deadline_event_started(struct k_deadline_event *event, int deadline,
 
 		z_deadline_miss_report(&miss);
 	}
+	return now;
 }
 
 void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
@@ -116,6 +170,21 @@ void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 
 	__ASSERT(!arch_is_in_isr(), "deadline event wait from ISR");
 
+	if (IS_ENABLED(CONFIG_SCHED_DEADLINE_ADMISSION) ||
+	    IS_ENABLED(CONFIG_SCHED_DEADLINE_STATS)) {
+		k_spinlock_key_t key = z_sched_spinlock_lock();
+
+		z_deadline_admission_finished(event);
+		z_sched_spinlock_unlock(key);
+#ifdef CONFIG_SCHED_DEADLINE_STATS
+		if (event->run_open) {
+			uint32_t run = k_cycle_get_32() - event->run_begin;
+
+			event->max_run = MAX(event->max_run, run);
+			event->run_open = false;
+		}
+#endif
+	}
 	for (;;) {
 		k_spinlock_key_t key = z_sched_spinlock_lock();
 
@@ -131,8 +200,11 @@ void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 			bool released_idle = event->released_idle;
 			uint32_t release = event->release;
 			struct k_thread *released_over = event->released_over;
+			bool has_not_before = event->has_not_before;
+			uint32_t not_before = event->not_before;
 
 			event->pending = false;
+			event->has_not_before = false;
 			z_sched_spinlock_unlock(key);
 			/*
 			 * The consumer may have run since its release, and this
@@ -140,8 +212,19 @@ void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 			 * its own deadline, never the key of an earlier run.
 			 */
 			z_sched_current_deadline_update(deadline);
-			deadline_event_started(event, deadline, released_idle, release,
-					       released_over);
+			uint32_t start = deadline_event_started(event, deadline, released_idle,
+								release, released_over,
+								has_not_before, not_before);
+
+			if (IS_ENABLED(CONFIG_SCHED_DEADLINE_ADMISSION)) {
+				key = z_sched_spinlock_lock();
+				z_deadline_admission_started(event, start);
+				z_sched_spinlock_unlock(key);
+			}
+#ifdef CONFIG_SCHED_DEADLINE_STATS
+			event->run_begin = start;
+			event->run_open = true;
+#endif
 			return;
 		}
 
@@ -303,3 +386,12 @@ static inline int z_vrfy_k_thread_release_with_deadline(k_tid_t tid,
 }
 #include <zephyr/syscalls/k_thread_release_with_deadline_mrsh.c>
 #endif /* CONFIG_USERSPACE */
+
+#ifdef CONFIG_SCHED_DEADLINE_STATS
+void k_deadline_event_stats_get(const struct k_deadline_event *event, uint32_t *max_run,
+				uint32_t *max_latency)
+{
+	*max_run = event->max_run;
+	*max_latency = event->max_latency;
+}
+#endif

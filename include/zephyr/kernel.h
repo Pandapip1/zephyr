@@ -1136,6 +1136,29 @@ struct k_deadline_event {
 	struct k_thread *released_over;
 	/* Name for missed-deadline reports, or NULL. */
 	const char *name;
+	/* The pending run may not start before not_before (k_deadline_event_post_at()). */
+	bool has_not_before;
+	uint32_t not_before;
+#ifdef CONFIG_SCHED_DEADLINE_ADMISSION
+	/* Admission control state, under the scheduler lock. */
+	sys_snode_t admission_node;
+	/* Worst-case execution time of one run, cycles; 0 when not admission-controlled. */
+	uint32_t budget;
+	/* Start of the run in progress. */
+	uint32_t run_start;
+	/* An admitted timed release that has not been posted yet. */
+	uint32_t future_release;
+	int future_deadline;
+	uint8_t admission_state;
+	bool future;
+#endif
+#ifdef CONFIG_SCHED_DEADLINE_STATS
+	/* Longest run and longest release-to-start latency seen, cycles. */
+	uint32_t max_run;
+	uint32_t max_latency;
+	uint32_t run_begin;
+	bool run_open;
+#endif
 };
 
 /** @cond INTERNAL_HIDDEN */
@@ -1207,6 +1230,105 @@ __syscall void k_deadline_event_reset(struct k_deadline_event *event);
  * @param event Deadline event to wait on.
  */
 __syscall void k_deadline_event_wait(struct k_deadline_event *event);
+
+/**
+ * @brief Post a publication whose run may not start before @p not_before.
+ *
+ * Like k_deadline_event_post(), but the consumer's next wait returns no
+ * earlier than @p not_before: a consumer released earlier waits it out by
+ * spinning at its own priority. This lets a timed release be armed early by
+ * the wake path's latency and still start exactly at its instant. A plain
+ * post coalesced with it removes the bound.
+ *
+ * @isr_ok
+ *
+ * @param event Deadline event to post.
+ * @param not_before Earliest start, in @ref k_cycle_get_32 units.
+ * @param deadline Start-by deadline, as for k_deadline_event_post().
+ */
+void k_deadline_event_post_at(struct k_deadline_event *event, uint32_t not_before, int deadline);
+
+#if defined(CONFIG_SCHED_DEADLINE_ADMISSION) || defined(__DOXYGEN__)
+/**
+ * @brief Declare the worst-case execution time of one run of @p event.
+ *
+ * Registers @p event for admission control: from now on every release of it
+ * is checked for feasibility against the other admitted work before it runs
+ * (include/zephyr/kernel/deadline_miss.h, K_DEADLINE_MISS_UNSAT). A run is
+ * the consumer's execution from one k_deadline_event_wait() return to its
+ * next call. Must not race with posting.
+ *
+ * @param event Deadline event.
+ * @param budget Worst-case execution time of one run, in @ref k_cycle_get_32
+ *               units; 0 removes @p event from admission control.
+ */
+void k_deadline_event_budget_set(struct k_deadline_event *event, uint32_t budget);
+
+/**
+ * @brief Admit a timed release of @p event before arming it.
+ *
+ * Checks that a release at @p release can start by @p deadline given all
+ * admitted work, then keeps it as admitted future demand until it is
+ * posted or cancelled. Infeasibility, for this release or for work admitted
+ * earlier that it would push past its deadline, is reported to the
+ * missed-deadline policy as K_DEADLINE_MISS_UNSAT for the job priority
+ * sacrifices.
+ *
+ * @isr_ok
+ *
+ * @param event Deadline event that will be released.
+ * @param release When the release will be posted, in @ref k_cycle_get_32 units.
+ * @param not_before Earliest start of its run (equal to @p release unless
+ *                   posted with k_deadline_event_post_at()).
+ * @param deadline Start-by deadline of the run.
+ *
+ * @retval 0 Feasible.
+ * @retval -ETIME Infeasible; reported.
+ */
+int k_deadline_event_admit(struct k_deadline_event *event, uint32_t release, uint32_t not_before,
+			   int deadline);
+
+/**
+ * @brief Withdraw an admitted timed release that will not be posted.
+ *
+ * @isr_ok
+ *
+ * @param event Deadline event.
+ */
+void k_deadline_event_admit_cancel(struct k_deadline_event *event);
+
+/**
+ * @brief Check whether @p cycles of extra work at priority @p prio from now keeps
+ *        all admitted work feasible.
+ *
+ * For work outside any deadline event that the caller is about to do, such as
+ * a bounded busy-wait at its own priority. Infeasibility is reported as
+ * K_DEADLINE_MISS_UNSAT for the job priority sacrifices.
+ *
+ * @isr_ok
+ *
+ * @param prio Thread priority the work runs at.
+ * @param cycles Duration of the work, in @ref k_cycle_get_32 units.
+ *
+ * @retval 0 Feasible.
+ * @retval -ETIME Infeasible; reported.
+ */
+int k_deadline_demand_admit(int prio, uint32_t cycles);
+#endif
+
+#if defined(CONFIG_SCHED_DEADLINE_STATS) || defined(__DOXYGEN__)
+/**
+ * @brief Longest run and release-to-start latency of @p event since boot.
+ *
+ * For measuring execution-time budgets on the target.
+ *
+ * @param event Deadline event.
+ * @param max_run Longest run, in @ref k_cycle_get_32 units.
+ * @param max_latency Longest delay from a release from idle to its start.
+ */
+void k_deadline_event_stats_get(const struct k_deadline_event *event, uint32_t *max_run,
+				uint32_t *max_latency);
+#endif
 
 /**
  * @brief Construct an absolute scheduler deadline from a relative cycle count.

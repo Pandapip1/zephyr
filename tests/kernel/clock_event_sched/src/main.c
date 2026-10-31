@@ -381,4 +381,104 @@ ZTEST(clock_event_sched, test_late_delivery_is_reported)
 	zassert_equal(k_clock_event_sched_late_count(), late_before + 1U);
 }
 
+/* Logical cycles of one fake deep (LF) and one fake active (HF) cycle. */
+#define DEEP_CYCLE_LOGICAL   DIV_ROUND_UP(LOGICAL_HZ, DEEP_HZ)
+#define ACTIVE_CYCLE_LOGICAL DIV_ROUND_UP(LOGICAL_HZ, ACTIVE_HZ)
+
+void z_clock_event_sched_test_active_stopped(bool stopped);
+
+static uint64_t us_ahead(uint32_t us)
+{
+	return k_clock_event_sched_now() + (uint64_t)us * LOGICAL_HZ / USEC_PER_SEC;
+}
+
+/*
+ * Rung 1: a lead covering the deep provider's floor plus the active clock's
+ * start-up (CLOCK_EVENT_SCHED_DEEP_WAKE_NS) is planned on the deep provider,
+ * which wakes early and lets the active provider deliver the target exactly.
+ * The same holds with the active clock stopped: the deep wake restarts it.
+ */
+ZTEST(clock_event_sched, test_plan_long_lead_uses_deep_then_active)
+{
+	struct k_clock_event_sched_plan plan;
+	uint64_t target = us_ahead(1000U);
+
+	zassert_ok(k_clock_event_sched_plan(target, &plan));
+	zassert_equal(plan.rung, K_CLOCK_EVENT_SCHED_DEEP);
+	zassert_equal(plan.deliver_by, target, "two-stage delivery is exact");
+	zassert_equal(plan.caller_spin + plan.isr_spin, 0U);
+
+	z_clock_event_sched_test_active_stopped(true);
+	target = us_ahead(1000U);
+	zassert_ok(k_clock_event_sched_plan(target, &plan));
+	z_clock_event_sched_test_active_stopped(false);
+	zassert_equal(plan.rung, K_CLOCK_EVENT_SCHED_DEEP, "LF wake early enough for start-up");
+	zassert_equal(plan.deliver_by, target);
+}
+
+/*
+ * Rung 2: a lead too short for the deep provider but covering the active
+ * provider's minimum lead is exact on the active provider while it runs.
+ */
+ZTEST(clock_event_sched, test_plan_short_lead_uses_running_active)
+{
+	struct k_clock_event_sched_plan plan;
+	uint64_t target = us_ahead(100U);
+
+	zassert_ok(k_clock_event_sched_plan(target, &plan));
+	zassert_equal(plan.rung, K_CLOCK_EVENT_SCHED_ACTIVE, "infeasible on LF, HF arm available");
+	zassert_equal(plan.deliver_by, target);
+}
+
+/*
+ * With the active clock stopped and too little lead to restart it from a deep
+ * wake, the target can only be waited out on the deep clock: one LF cycle of
+ * granularity, and the wait is the caller's.
+ */
+ZTEST(clock_event_sched, test_plan_stopped_active_short_lead_spins_on_deep)
+{
+	struct k_clock_event_sched_plan plan;
+	uint64_t now = k_clock_event_sched_now();
+	uint64_t target = us_ahead(100U);
+
+	z_clock_event_sched_test_active_stopped(true);
+	zassert_ok(k_clock_event_sched_plan(target, &plan));
+	z_clock_event_sched_test_active_stopped(false);
+	zassert_equal(plan.rung, K_CLOCK_EVENT_SCHED_SPIN);
+	zassert_equal(plan.deliver_by, target + DEEP_CYCLE_LOGICAL, "LF granularity");
+	zassert_true(plan.caller_spin <= target - now && plan.caller_spin > 0U);
+}
+
+/*
+ * Rung 3: inside every lead, an expiry already armed at or before the target
+ * is ridden: its interrupt waits out the rest. Without one, the caller waits.
+ */
+ZTEST(clock_event_sched, test_plan_inside_lead_rides_an_armed_expiry)
+{
+	struct k_clock_event_sched_plan plan;
+	struct fake_slot *a = &active.slots[0];
+	uint64_t armed_at = us_ahead(100U);
+	uint64_t target;
+
+	zassert_ok(k_clock_event_arm_abs(&second, (uint32_t)armed_at));
+	zassert_true(a->armed, "the other client is armed on the active provider");
+	/* Wait until the target is inside the active lead but after that expiry. */
+	target = armed_at + ACTIVE_CYCLE_LOGICAL / 4U;
+	/* Advance until the target is inside the active lead; every read advances time. */
+	while (k_clock_event_sched_now() + (uint64_t)ACTIVE_MIN * ACTIVE_CYCLE_LOGICAL <= target) {
+	}
+	zassert_true(k_clock_event_sched_now() < armed_at, "the other expiry is still ahead");
+	zassert_ok(k_clock_event_sched_plan(target, &plan));
+	zassert_equal(plan.rung, K_CLOCK_EVENT_SCHED_ARMED);
+	zassert_equal(plan.deliver_by, target);
+	zassert_true(plan.isr_spin > 0U && plan.isr_spin <= target - armed_at + 1U);
+	zassert_equal(plan.caller_spin, 0U);
+
+	k_clock_event_cancel(&second);
+	zassert_ok(k_clock_event_sched_plan(target, &plan));
+	zassert_equal(plan.rung, K_CLOCK_EVENT_SCHED_SPIN, "no armed wakeup: the caller waits");
+	zassert_true(plan.caller_spin > 0U);
+	zassert_equal(plan.deliver_by, target + ACTIVE_CYCLE_LOGICAL, "HF granularity");
+}
+
 ZTEST_SUITE(clock_event_sched, NULL, setup, before, NULL, NULL);

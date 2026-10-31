@@ -13,6 +13,7 @@ struct fake_provider {
 	uint32_t generation;
 	unsigned int arms;
 	unsigned int cancels;
+	uint32_t armed_at;
 };
 
 static uint32_t fake_now(void *context)
@@ -33,7 +34,7 @@ static int fake_arm(void *context, uint32_t deadline, uint32_t generation)
 {
 	struct fake_provider *provider = context;
 
-	ARG_UNUSED(deadline);
+	provider->armed_at = deadline;
 	provider->generation = generation;
 	provider->arms++;
 	return 0;
@@ -77,6 +78,7 @@ static void reset(struct fake_provider *provider)
 					 unused_clock_event_handler, NULL), 0, "clock init failed");
 	zassert_equal(k_deferred_release_init(&release, &event, &clock_event), 0,
 		      "init failed");
+	k_deferred_release_lead_set(&release, 0U);
 }
 
 ZTEST(deferred_release, test_future_release_waits_for_provider_expiry)
@@ -133,6 +135,27 @@ ZTEST(deferred_release, test_selected_provider_arms_deferred_release)
 	zassert_false(event.pending, "selected release posted early");
 	k_clock_event_fire(&selected_clock_event, selected_provider.generation);
 	zassert_true(event.pending, "selected provider expiry did not release event");
+}
+
+/*
+ * A lead taken off the arm compensates the wake path: the clock event is armed
+ * that much before the release time, and the publication it makes carries the
+ * release time as the run's not-before bound.
+ */
+ZTEST(deferred_release, test_lead_arms_early_and_bounds_the_start)
+{
+	struct fake_provider provider;
+
+	reset(&provider);
+	k_deferred_release_lead_set(&release, 4U);
+	zassert_equal(k_deferred_release_post(&release, 120U, 222), 0, "arm failed");
+	zassert_equal(provider.arms, 1U, "provider was not armed");
+	zassert_equal(provider.armed_at, 116U, "not armed a lead early");
+	zassert_false(event.pending, "released before the early arm expired");
+	k_clock_event_fire(&clock_event, provider.generation);
+	zassert_true(event.pending, "expiry did not release event");
+	zassert_true(event.has_not_before, "release time not carried");
+	zassert_equal(event.not_before, 120U, "wrong not-before bound");
 }
 
 ZTEST_SUITE(deferred_release, NULL, NULL, NULL, NULL, NULL);

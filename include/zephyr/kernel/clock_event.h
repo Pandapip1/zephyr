@@ -196,6 +196,53 @@ uint64_t k_clock_event_sched_now(void);
  */
 uint32_t k_clock_event_sched_late_count(void);
 
+/** How the scheduler clock service would deliver an expiry, best rung first. */
+enum k_clock_event_sched_rung {
+	/** Deep-sleep provider: its lead covers its floor plus the active clock's start-up. */
+	K_CLOCK_EVENT_SCHED_DEEP,
+	/** Active provider, running now: exact. */
+	K_CLOCK_EVENT_SCHED_ACTIVE,
+	/** An expiry already armed at or before the target, waited out in its interrupt. */
+	K_CLOCK_EVENT_SCHED_ARMED,
+	/** Inside every lead: the caller waits it out on the service's clock. */
+	K_CLOCK_EVENT_SCHED_SPIN,
+};
+
+/** A delivery plan from @ref k_clock_event_sched_plan. Times are logical cycles. */
+struct k_clock_event_sched_plan {
+	enum k_clock_event_sched_rung rung;
+	/** Latest instant the expiry is delivered: the target plus the rung's granularity. */
+	uint64_t deliver_by;
+	/** Time the caller spends waiting for the target (K_CLOCK_EVENT_SCHED_SPIN). */
+	uint64_t caller_spin;
+	/** Time an expiry interrupt spends waiting for the target (K_CLOCK_EVENT_SCHED_ARMED). */
+	uint64_t isr_spin;
+};
+
+/**
+ * @brief Plan the delivery of an expiry at @p target without arming anything.
+ *
+ * The rungs, in the order the service uses them:
+ *
+ * 1. The deep-sleep provider, when the lead covers its arm floor plus
+ *    CONFIG_CLOCK_EVENT_SCHED_DEEP_WAKE_NS, the start-up of the active clock
+ *    that finishes the wait: delivery at the target, or within two deep cycles
+ *    of it without an active provider.
+ * 2. The active provider, when it is running and the lead covers its minimum
+ *    lead: delivery at the target.
+ * 3. An expiry already armed on either provider at or before the target: the
+ *    service waits out the rest in that interrupt.
+ * 4. Waiting in the caller on the service's clock, to within one cycle of the
+ *    provider that feeds it.
+ *
+ * @param target Absolute logical deadline.
+ * @param plan Filled with the chosen rung.
+ *
+ * @retval 0 Planned.
+ * @retval -ENODEV No deep-sleep provider is registered.
+ */
+int k_clock_event_sched_plan(uint64_t target, struct k_clock_event_sched_plan *plan);
+
 /** Return the provider's minimum reliable absolute-arm lead, in cycles. */
 uint32_t k_clock_event_min_arm_cycles(const struct k_clock_event *event);
 

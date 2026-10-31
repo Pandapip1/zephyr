@@ -87,6 +87,16 @@ static uint32_t cycles_to_ns(int32_t cycles)
 	return (uint32_t)k_cyc_to_ns_floor64((uint64_t)MAX(cycles, 0));
 }
 
+/* A cycle difference read as signed, in ns. */
+static int signed_ns(uint32_t diff)
+{
+	int32_t cycles = (int32_t)diff;
+	uint64_t magnitude = (cycles < 0) ? (uint64_t)(-(int64_t)cycles) : (uint64_t)cycles;
+	int64_t ns = (int64_t)k_cyc_to_ns_floor64(magnitude);
+
+	return (int)((cycles < 0) ? -ns : ns);
+}
+
 void k_deadline_miss_print(const struct k_deadline_miss *miss)
 {
 	printk("deadline %s: %s %p thread %p: released %u, deadline %d, now %u: "
@@ -96,7 +106,12 @@ void k_deadline_miss_print(const struct k_deadline_miss *miss)
 	       cycles_to_ns((int32_t)(miss->now - (uint32_t)miss->deadline)),
 	       cycles_to_ns((int32_t)(miss->now - miss->release)));
 	if (miss->kind == K_DEADLINE_MISS_UNSAT) {
-		printk("  demand ahead of it: %u ns\n", cycles_to_ns((int32_t)miss->demand));
+		/* Found before the job runs: its release and deadline may lie ahead. */
+		printk("  release %d ns and deadline %d ns from the check, "
+		       "demand ahead of it %u ns\n",
+		       signed_ns(miss->release - miss->now),
+		       signed_ns((uint32_t)miss->deadline - miss->now),
+		       cycles_to_ns((int32_t)miss->demand));
 	}
 	printk("  running at release: thread %p\n", (void *)miss->running_at_release);
 	for (uint8_t i = 0U; i < miss->ran_count; i++) {
