@@ -1109,7 +1109,6 @@ __syscall int k_thread_priority_get(k_tid_t thread);
 __syscall void k_thread_priority_set(k_tid_t thread, int prio);
 
 
-#ifdef CONFIG_SCHED_DEADLINE
 /**
  * @brief One-bit event latch for a deadline-scheduled persistent thread.
  *
@@ -1122,6 +1121,8 @@ __syscall void k_thread_priority_set(k_tid_t thread, int prio);
  *
  * The fields are internal.  Initialize with @ref K_DEADLINE_EVENT_DEFINE or
  * @ref k_deadline_event_init before use.
+ *
+ * @kconfig_dep{CONFIG_SCHED_DEADLINE}
  */
 struct k_deadline_event {
 	struct k_thread *consumer;
@@ -1353,6 +1354,7 @@ void k_deadline_event_stats_get(const struct k_deadline_event *event, uint32_t *
 				uint32_t *max_latency);
 #endif
 
+#ifdef CONFIG_SCHED_DEADLINE
 /**
  * @brief Construct an absolute scheduler deadline from a relative cycle count.
  *
