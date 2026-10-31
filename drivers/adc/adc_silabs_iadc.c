@@ -79,8 +79,10 @@ struct iadc_chan_conf {
 struct iadc_data {
 	const struct device *dev;
 	struct adc_context ctx;
-	struct iadc_chan_conf chan_conf[SL_HAL_IADC_CHANNEL_ID_MAX];
+	struct iadc_chan_conf chan_conf[CONFIG_ADC_SILABS_IADC_CHANNELS];
+#ifdef CONFIG_ADC_SILABS_IADC_DMA
 	struct iadc_dma_channel dma;
+#endif
 	uint8_t adc_config_count; /* Number of ADC configs created (max 2) */
 	uint32_t clock_rate;
 	uint32_t channels;
@@ -141,6 +143,17 @@ static void iadc_configure_scan_table_entry(sl_hal_iadc_scan_table_entry_t *entr
 		.config_id = chan_conf->iadc_conf_id,
 		.include_in_scan = true,
 	};
+}
+
+/* DMA controller the instance reads its scan FIFO through, or NULL. */
+static inline const struct device *iadc_dma_dev(const struct iadc_data *data)
+{
+#ifdef CONFIG_ADC_SILABS_IADC_DMA
+	return data->dma.dma_dev;
+#else
+	ARG_UNUSED(data);
+	return NULL;
+#endif
 }
 
 #ifdef CONFIG_ADC_SILABS_IADC_DMA
@@ -316,7 +329,7 @@ static int iadc_set_config(const struct device *dev)
 	uint32_t channels;
 	int res;
 
-	if (data->dma.dma_dev) {
+	if (iadc_dma_dev(data) != NULL) {
 		scan_init.data_valid_level = _IADC_SCANFIFOCFG_DVL_VALID1;
 		/* Only needed to wake up DMA if EM is 2/3 */
 		scan_init.fifo_dma_wakeup = true;
@@ -324,6 +337,7 @@ static int iadc_set_config(const struct device *dev)
 
 	data->adc_config_count = 0;
 
+#ifdef CONFIG_ADC_SILABS_IADC_DMA
 	if (data->dma.dma_dev) {
 		if (data->alignment == _IADC_SCANFIFOCFG_ALIGNMENT_RIGHT20) {
 			data->dma.dma_cfg.source_data_size = 4;
@@ -337,6 +351,7 @@ static int iadc_set_config(const struct device *dev)
 			data->dma.dma_cfg.dest_burst_length = 2;
 		}
 	}
+#endif
 
 	channels = data->channels;
 
@@ -506,7 +521,7 @@ static int start_read(const struct device *dev, const struct adc_sequence *seque
 	channel_count = 0;
 	while (channels) {
 		index = find_lsb_set(channels) - 1;
-		if (index >= SL_HAL_IADC_CHANNEL_ID_MAX) {
+		if (index >= ARRAY_SIZE(data->chan_conf)) {
 			LOG_DBG("Requested channel index not available: %d", index);
 			return -EINVAL;
 		}
@@ -527,10 +542,12 @@ static int start_read(const struct device *dev, const struct adc_sequence *seque
 	data->buffer = sequence->buffer;
 	data->active_channels = channel_count;
 
+#ifdef CONFIG_ADC_SILABS_IADC_DMA
 	if (data->dma.dma_dev) {
 		data->dma.blk_cfg.dest_address = (uintptr_t)data->buffer;
 		data->dma.blk_cfg.block_size = channel_count * data->data_size;
 	}
+#endif
 
 	data->channels = sequence->channels;
 
@@ -641,7 +658,7 @@ static void iadc_isr(void *arg)
 
 	sl_hal_iadc_clear_interrupts(iadc, flags);
 
-	if (((flags & IADC_IF_SCANTABLEDONE) != 0U) && (data->dma.dma_dev == NULL)) {
+	if (((flags & IADC_IF_SCANTABLEDONE) != 0U) && (iadc_dma_dev(data) == NULL)) {
 		while (sl_hal_iadc_get_scan_fifo_cnt(iadc) > 0) {
 			sample = sl_hal_iadc_pull_scan_fifo_result(iadc);
 			memcpy(data->sample_ptr, &sample.data, data->data_size);
@@ -691,7 +708,7 @@ static int iadc_channel_setup(const struct device *dev, const struct adc_channel
 	struct iadc_data *data = dev->data;
 	struct iadc_chan_conf *chan_conf = NULL;
 
-	if (channel_cfg->channel_id < SL_HAL_IADC_CHANNEL_ID_MAX) {
+	if (channel_cfg->channel_id < ARRAY_SIZE(data->chan_conf)) {
 		chan_conf = &data->chan_conf[channel_cfg->channel_id];
 	} else {
 		LOG_DBG("Requested channel index not available: %d", channel_cfg->channel_id);

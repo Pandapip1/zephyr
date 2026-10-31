@@ -48,6 +48,16 @@ config ADC_SILABS_IADC
 
 if ADC_SILABS_IADC
 
+config ADC_SILABS_IADC_CHANNELS
+	int "Channel IDs per IADC instance"
+	range 1 16
+	default 16
+	help
+	  Number of channel IDs, 0 to N - 1, that adc_channel_setup() accepts
+	  on each IADC instance. The hardware scan table has 16 entries; each
+	  channel ID keeps its configuration in the instance's RAM, so an
+	  application that uses fewer channels can lower this.
+
 config ADC_SILABS_IADC_DMA
 	bool "Silabs IADC async DMA support"
 	select DMA
