@@ -116,6 +116,77 @@ static void coalesced_second_worker(void *p1, void *p2, void *p3)
 	k_thread_suspend(k_current_get());
 }
 
+#define LEVEL_THREADS 2
+struct k_deadline_event level_events[LEVEL_THREADS];
+K_SEM_DEFINE(level_armed, 0, LEVEL_THREADS);
+struct k_thread level_threads[LEVEL_THREADS];
+K_THREAD_STACK_ARRAY_DEFINE(level_stacks, LEVEL_THREADS, STACK_SIZE);
+volatile int level_runs;
+char level_order[3];
+int level_inner_deadline;
+
+static void level_record(char run)
+{
+	zassert_true(level_runs < (int)ARRAY_SIZE(level_order), "too many level runs");
+	level_order[level_runs++] = run;
+}
+
+static void level_post_inner(const void *param)
+{
+	ARG_UNUSED(param);
+	k_deadline_event_post(&level_events[1], level_inner_deadline);
+}
+
+/* Released first; releases the other job from an IRQ while it runs. */
+static void level_outer_worker(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	k_sem_give(&level_armed);
+	k_deadline_event_wait(&level_events[0]);
+	level_record('o');
+	irq_offload(level_post_inner, NULL);
+	level_record('O');
+	k_thread_suspend(k_current_get());
+}
+
+static void level_inner_worker(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	k_sem_give(&level_armed);
+	k_deadline_event_wait(&level_events[1]);
+	level_record('i');
+	k_thread_suspend(k_current_get());
+}
+
+static void level_run(int outer_prio, int outer_deadline, int inner_prio, int inner_deadline)
+{
+	level_runs = 0;
+	level_inner_deadline = inner_deadline;
+	k_sem_reset(&level_armed);
+	for (int i = 0; i < LEVEL_THREADS; i++) {
+		k_deadline_event_init(&level_events[i]);
+	}
+	(void)k_thread_create(&level_threads[0], level_stacks[0], STACK_SIZE,
+			      level_outer_worker, NULL, NULL, NULL, outer_prio, 0, K_NO_WAIT);
+	(void)k_thread_create(&level_threads[1], level_stacks[1], STACK_SIZE,
+			      level_inner_worker, NULL, NULL, NULL, inner_prio, 0, K_NO_WAIT);
+	for (int i = 0; i < LEVEL_THREADS; i++) {
+		k_sem_take(&level_armed, K_FOREVER);
+	}
+	k_deadline_event_post(&level_events[0], outer_deadline);
+	k_sleep(K_MSEC(1));
+	zassert_equal(level_runs, 3, "not every run happened");
+	for (int i = 0; i < LEVEL_THREADS; i++) {
+		k_thread_abort(&level_threads[i]);
+	}
+}
+
 static void event_latch_post_twice(const void *param)
 {
 	struct k_deadline_event *event = (struct k_deadline_event *)param;
@@ -430,6 +501,42 @@ ZTEST(suite_deadline, test_deadline_event_latched_run_keeps_its_deadline)
 	for (int i = 0; i < COALESCED_THREADS; i++) {
 		k_thread_abort(&coalesced_threads[i]);
 	}
+}
+
+/**
+ * @brief Verify a higher meta-IRQ level preempts a running lower one.
+ *
+ * A job at the second meta-IRQ level runs and releases, from an IRQ, a job at
+ * the first level whose deadline is later. The higher-priority job runs at
+ * IRQ exit, before the lower one finishes: static priority decides across
+ * levels, regardless of deadlines.
+ */
+ZTEST(suite_deadline, test_deadline_event_metairq_level_preempts)
+{
+	level_run(K_HIGHEST_THREAD_PRIO + 1, K_DEADLINE(MSEC_TO_CYCLES(10)),
+		  K_HIGHEST_THREAD_PRIO, K_DEADLINE(MSEC_TO_CYCLES(30)));
+	zassert_mem_equal(level_order, "oiO", 3,
+			  "a higher meta-IRQ level did not preempt a lower one");
+}
+
+/**
+ * @brief Verify meta-IRQ threads stay cooperative within their priority.
+ *
+ * A meta-IRQ thread preempts threads of lower priority only. A job at the
+ * same meta-IRQ level released with an earlier deadline waits for the running
+ * one to reach a scheduling point, like an interrupt of equal priority; so
+ * does one with a later deadline.
+ */
+ZTEST(suite_deadline, test_deadline_event_metairq_same_level_cooperative)
+{
+	level_run(K_HIGHEST_THREAD_PRIO, K_DEADLINE(MSEC_TO_CYCLES(30)),
+		  K_HIGHEST_THREAD_PRIO, K_DEADLINE(MSEC_TO_CYCLES(10)));
+	zassert_mem_equal(level_order, "oOi", 3,
+			  "an earlier deadline preempted within a meta-IRQ level");
+	level_run(K_HIGHEST_THREAD_PRIO, K_DEADLINE(MSEC_TO_CYCLES(10)),
+		  K_HIGHEST_THREAD_PRIO, K_DEADLINE(MSEC_TO_CYCLES(30)));
+	zassert_mem_equal(level_order, "oOi", 3,
+			  "a later deadline preempted within a meta-IRQ level");
 }
 
 void worker(void *p1, void *p2, void *p3)

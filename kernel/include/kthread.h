@@ -242,7 +242,17 @@ static ALWAYS_INLINE bool should_preempt(const struct k_thread *thread,
 	/* Otherwise we have to be running a preemptible thread or
 	 * switching to a metairq
 	 */
-	if (thread_is_preemptible(_current) || thread_is_metairq(thread)) {
+	if (thread_is_preemptible(_current)) {
+		return true;
+	}
+
+	/* A metairq preempts cooperative threads and metairqs of lower
+	 * priority, but stays cooperative within its own priority: an
+	 * earlier deadline at that priority waits for a scheduling point.
+	 */
+	if (thread_is_metairq(thread) &&
+	    (!thread_is_metairq(_current) ||
+	     (thread->base.prio < _current->base.prio))) {
 		return true;
 	}
 
