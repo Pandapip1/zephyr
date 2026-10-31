@@ -7,6 +7,8 @@
 
 struct fake_provider {
 	uint32_t now;
+	/* When non-zero, each clock read advances time by this many cycles. */
+	uint32_t tick_per_read;
 	uint32_t min_lead;
 	uint32_t generation;
 	unsigned int arms;
@@ -15,7 +17,11 @@ struct fake_provider {
 
 static uint32_t fake_now(void *context)
 {
-	return ((struct fake_provider *)context)->now;
+	struct fake_provider *provider = context;
+	uint32_t now = provider->now;
+
+	provider->now += provider->tick_per_read;
+	return now;
 }
 
 static uint32_t fake_min_lead(void *context)
@@ -97,15 +103,17 @@ ZTEST(deferred_release, test_due_release_posts_immediately)
 	zassert_true(event.pending, "due release was not posted");
 }
 
-ZTEST(deferred_release, test_too_late_future_release_is_not_posted_early)
+ZTEST(deferred_release, test_inside_lead_release_waits_then_posts)
 {
 	struct fake_provider provider;
 
 	reset(&provider);
-	zassert_equal(k_deferred_release_post(&release, 104U, 222), -ETIME,
-		      "inside-lead release was accepted");
-	zassert_equal(provider.arms, 0U, "too-late release reached provider");
-	zassert_false(event.pending, "too-late release posted early");
+	provider.tick_per_read = 1U;
+	zassert_equal(k_deferred_release_post(&release, 104U, 222), 0,
+		      "inside-lead release was refused");
+	zassert_equal(provider.arms, 0U, "inside-lead release reached provider");
+	zassert_true(event.pending, "inside-lead release was dropped");
+	zassert_true((int32_t)(provider.now - 104U) >= 0, "inside-lead release posted early");
 }
 
 ZTEST(deferred_release, test_selected_provider_arms_deferred_release)

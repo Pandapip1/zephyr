@@ -2,6 +2,7 @@
 
 #include <errno.h>
 
+#include <zephyr/kernel.h>
 #include <zephyr/kernel/deferred_release.h>
 
 static void deferred_release_fire(struct k_clock_event *clock_event, uint32_t generation,
@@ -25,6 +26,18 @@ static void deferred_release_fire(struct k_clock_event *clock_event, uint32_t ge
 	}
 }
 
+/*
+ * A release time inside the provider's minimum arm lead cannot be armed, but
+ * it is still a release time: wait it out on the provider's own clock rather
+ * than drop the release or publish it early. The wait is bounded by that lead.
+ */
+static void deferred_release_wait_until(struct k_clock_event *clock_event, uint32_t not_before)
+{
+	while ((int32_t)(not_before - k_clock_event_now(clock_event)) > 0) {
+		arch_nop();
+	}
+}
+
 int k_deferred_release_init(struct k_deferred_release *release,
 			    struct k_deadline_event *event,
 			    struct k_clock_event *clock_event)
@@ -45,6 +58,7 @@ int k_deferred_release_post(struct k_deferred_release *release,
 	struct k_clock_event *clock_event;
 	struct k_deadline_event *event = NULL;
 	uint32_t now;
+	bool wait = false;
 	int ret = 0;
 
 	if (release == NULL || release->event == NULL) {
@@ -63,10 +77,19 @@ int k_deferred_release_post(struct k_deferred_release *release,
 			release->deadline = deadline;
 			release->armed = true;
 			ret = k_clock_event_arm_abs(clock_event, not_before);
-			if (ret != 0) {
+			if (ret == -ETIME) {
+				/* Inside the arm lead: wait it out after unlocking. */
+				release->armed = false;
+				wait = true;
+				ret = 0;
+			} else if (ret != 0) {
 				release->armed = false;
 			}
 		}
+	}
+	if (wait) {
+		deferred_release_wait_until(clock_event, not_before);
+		k_deadline_event_post(release->event, deadline);
 	}
 	if (event != NULL) {
 		k_deadline_event_post(event, deadline);
@@ -83,6 +106,7 @@ int k_deferred_release_post_selected(struct k_deferred_release *release,
 	const struct k_clock_event_provider *provider;
 	struct k_deadline_event *event = NULL;
 	uint32_t now;
+	bool wait = false;
 	int ret = 0;
 
 	if (release == NULL || release->event == NULL || clock_event == NULL) {
@@ -119,10 +143,19 @@ int k_deferred_release_post_selected(struct k_deferred_release *release,
 			release->deadline = deadline;
 			release->armed = true;
 			ret = k_clock_event_arm_abs(clock_event, not_before);
-			if (ret != 0) {
+			if (ret == -ETIME) {
+				/* Inside the arm lead: wait it out after unlocking. */
+				release->armed = false;
+				wait = true;
+				ret = 0;
+			} else if (ret != 0) {
 				release->armed = false;
 			}
 		}
+	}
+	if (wait) {
+		deferred_release_wait_until(clock_event, not_before);
+		k_deadline_event_post(release->event, deadline);
 	}
 	if (event != NULL) {
 		k_deadline_event_post(event, deadline);

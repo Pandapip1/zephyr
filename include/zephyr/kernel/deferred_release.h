@@ -42,9 +42,11 @@ int k_deferred_release_init(struct k_deferred_release *release,
  * @brief Publish @p event no earlier than @p not_before.
  *
  * If @p not_before has passed, publication is immediate. Otherwise it is
- * armed as an absolute clock event. An arm that the provider cannot complete
- * reliably returns -ETIME and does not publish early. Replaces an older
- * deferred publication that has not yet been released.
+ * armed as an absolute clock event. A @p not_before still ahead but inside the
+ * provider's minimum arm lead is waited out by spinning on the provider's
+ * clock, then published: never early and never dropped. The spin is bounded
+ * by that lead. Replaces an older deferred publication that has not yet been
+ * released.
  */
 int k_deferred_release_post(struct k_deferred_release *release,
 			    uint32_t not_before, int deadline);
