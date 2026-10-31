@@ -41,7 +41,7 @@ void z_impl_k_deadline_event_init(struct k_deadline_event *event)
 
 /* Record a publication; @p not_before is valid when @p has_not_before. */
 static void deadline_event_post(struct k_deadline_event *event, bool has_not_before,
-				uint32_t not_before, int deadline)
+				uint32_t not_before, int deadline, uint32_t budget)
 {
 	/* Read the clock outside the scheduler lock: it may take a lock of its own. */
 	uint32_t now = k_cycle_get_32();
@@ -78,6 +78,17 @@ static void deadline_event_post(struct k_deadline_event *event, bool has_not_bef
 		   (int32_t)(not_before - event->not_before) < 0) {
 		event->not_before = not_before;
 	}
+#ifdef CONFIG_SCHED_DEADLINE_ADMISSION
+	if (budget == 0U) {
+		budget = event->budget;
+	}
+	/* Coalesced publications are one run: it must fit the largest of their budgets. */
+	if (!event->pending || budget > event->pending_budget) {
+		event->pending_budget = budget;
+	}
+#else
+	ARG_UNUSED(budget);
+#endif
 	event->pending = true;
 	if (idle) {
 		/* Assign the EDF key before making the consumer observable as ready. */
@@ -100,12 +111,17 @@ static void deadline_event_post(struct k_deadline_event *event, bool has_not_bef
 
 void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
 {
-	deadline_event_post(event, false, 0U, deadline);
+	deadline_event_post(event, false, 0U, deadline, 0U);
 }
 
 void k_deadline_event_post_at(struct k_deadline_event *event, uint32_t not_before, int deadline)
 {
-	deadline_event_post(event, true, not_before, deadline);
+	deadline_event_post(event, true, not_before, deadline, 0U);
+}
+
+void k_deadline_event_post_budget(struct k_deadline_event *event, int deadline, uint32_t budget)
+{
+	deadline_event_post(event, false, 0U, deadline, budget);
 }
 
 void z_impl_k_deadline_event_reset(struct k_deadline_event *event)
@@ -202,6 +218,11 @@ void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 			struct k_thread *released_over = event->released_over;
 			bool has_not_before = event->has_not_before;
 			uint32_t not_before = event->not_before;
+#ifdef CONFIG_SCHED_DEADLINE_ADMISSION
+			uint32_t budget = event->pending_budget;
+#else
+			uint32_t budget = 0U;
+#endif
 
 			event->pending = false;
 			event->has_not_before = false;
@@ -218,7 +239,7 @@ void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 
 			if (IS_ENABLED(CONFIG_SCHED_DEADLINE_ADMISSION)) {
 				key = z_sched_spinlock_lock();
-				z_deadline_admission_started(event, start);
+				z_deadline_admission_started(event, start, budget);
 				z_sched_spinlock_unlock(key);
 			}
 #ifdef CONFIG_SCHED_DEADLINE_STATS

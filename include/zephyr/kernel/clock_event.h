@@ -191,6 +191,33 @@ int k_clock_event_sched_init(struct k_clock_event *event, k_clock_event_handler_
 uint64_t k_clock_event_sched_now(void);
 
 /**
+ * @brief Map an instant onto the running active provider's counter.
+ *
+ * For holding work to an instant more finely than one read of the logical
+ * time allows: the caller polls k_clock_event_sched_active_count() until it
+ * reaches @p count. Valid while the service stays on the active provider,
+ * i.e. while the CPU keeps running; a target already passed maps to the
+ * count of now.
+ *
+ * @param target Instant, in the low 32 bits of the logical time
+ *               (@ref k_cycle_get_32 units), within 2^31 cycles of now.
+ * @param count Filled with the active provider's count at @p target.
+ *
+ * @retval 0 Mapped.
+ * @retval -EAGAIN The service is not on its active provider.
+ */
+int k_clock_event_sched_active_target(uint32_t target, uint32_t *count);
+
+/**
+ * @brief Read the active provider's counter.
+ *
+ * One provider read, without the service's lock or logical conversion. Only
+ * meaningful against a count from k_clock_event_sched_active_target() while
+ * the service stays on the active provider.
+ */
+uint32_t k_clock_event_sched_active_count(void);
+
+/**
  * @brief Number of scheduler clock events delivered later than their deadline plus
  * CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS.
  */

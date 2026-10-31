@@ -407,4 +407,57 @@ ZTEST(deadline_admission, test_ladder_spin_only)
 	k_deadline_event_admit_cancel(&events[JOB_LOW]);
 }
 
+/*
+ * A publication carries its own budget (k_deadline_event_post_budget()): the same event,
+ * registered with a short budget, makes an admitted same-priority job unsat only when its
+ * publication declares the long one.
+ */
+static uint32_t budget_post_us;
+
+static void post_with_budget(const void *param)
+{
+	uint32_t now = k_cycle_get_32();
+
+	ARG_UNUSED(param);
+	k_deadline_event_post(&events[JOB_HIGH2], (int)(now + US(600U)));
+	k_deadline_event_post_budget(&events[JOB_HIGH], (int)(now + US(200U)), US(budget_post_us));
+}
+
+ZTEST(deadline_admission, test_publication_budget)
+{
+	budget(JOB_HIGH2, 100U);
+	budget(JOB_HIGH, 50U);
+	budget_post_us = 100U;
+	irq_offload(post_with_budget, NULL);
+	k_sleep(K_MSEC(2));
+	zassert_equal(misses, 0, "a short publication was reported");
+
+	budget_post_us = 650U;
+	irq_offload(post_with_budget, NULL);
+	zassert_true(misses >= 1, "the long publication's demand was not counted");
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
+	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH2]);
+}
+
+/*
+ * An admitted timed release keeps its not-before bound: a job released early that waits to its
+ * bound occupies its priority meanwhile, so a later check sees it as demand from the release.
+ */
+ZTEST(deadline_admission, test_future_release_keeps_not_before)
+{
+	uint32_t now = k_cycle_get_32();
+
+	budget(JOB_HIGH, 10U);
+	budget(JOB_HIGH2, 10U);
+	/* Released at +100 us, may not start before +900 us: it holds the priority from +100. */
+	zassert_equal(k_deadline_event_admit(&events[JOB_HIGH], now + US(100U), now + US(900U),
+					     (int)(now + US(1000U))), 0);
+	/* A same-priority job released at +200 us due by +400 us is behind that wait. */
+	zassert_equal(k_deadline_event_admit(&events[JOB_HIGH2], now + US(200U), now + US(200U),
+					     (int)(now + US(400U))), -ETIME);
+	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH2]);
+	k_deadline_event_admit_cancel(&events[JOB_HIGH]);
+	k_deadline_event_admit_cancel(&events[JOB_HIGH2]);
+}
+
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);

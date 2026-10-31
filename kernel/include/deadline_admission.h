@@ -26,7 +26,8 @@ struct admission_verdict {
 /* The scheduler lock is held by the caller of each of these but the last. */
 bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint32_t now,
 				 struct admission_verdict *verdict);
-void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now);
+void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now,
+				  uint32_t budget);
 void z_deadline_admission_finished(struct k_deadline_event *event);
 void z_deadline_admission_reset(struct k_deadline_event *event);
 void z_deadline_admission_report(const struct admission_verdict *verdict);
@@ -40,10 +41,12 @@ static inline bool z_deadline_admission_posted(struct k_deadline_event *event, b
 	ARG_UNUSED(verdict);
 	return true;
 }
-static inline void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now)
+static inline void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now,
+						uint32_t budget)
 {
 	ARG_UNUSED(event);
 	ARG_UNUSED(now);
+	ARG_UNUSED(budget);
 }
 static inline void z_deadline_admission_finished(struct k_deadline_event *event)
 {

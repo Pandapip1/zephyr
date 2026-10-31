@@ -196,18 +196,18 @@ static void sim_collect(struct sim *s, uint32_t now)
 				break;
 			}
 			j->started = true;
-			j->remaining = event->budget;
+			j->remaining = event->run_budget;
 			if (consumer == _current) {
 				uint32_t elapsed = now - event->run_start;
 
-				j->remaining = (elapsed < event->budget) ?
-					       event->budget - elapsed : 0U;
+				j->remaining = (elapsed < event->run_budget) ?
+					       event->run_budget - elapsed : 0U;
 				if (s->running < 0) {
 					s->running = (int)(j - s->jobs);
 				}
 			}
 			j->deadline = rel((uint32_t)consumer->base.prio_deadline, now);
-			j->work = event->budget;
+			j->work = event->run_budget;
 			if (event->pending) {
 				/* A run latched behind this one. */
 				struct sim_job *next = sim_add(s);
@@ -216,8 +216,8 @@ static void sim_collect(struct sim *s, uint32_t now)
 					*next = (struct sim_job){
 						.event = event,
 						.deadline = rel((uint32_t)event->deadline, now),
-						.remaining = event->budget,
-						.work = event->budget,
+						.remaining = event->pending_budget,
+						.work = event->pending_budget,
 						.prio = consumer->base.prio,
 						.cooperative = consumer->base.prio < 0,
 					};
@@ -228,11 +228,11 @@ static void sim_collect(struct sim *s, uint32_t now)
 			if (j == NULL) {
 				break;
 			}
-			j->remaining = event->budget;
+			j->remaining = event->pending_budget;
 			j->deadline = rel((uint32_t)event->deadline, now);
 			j->not_before = event->has_not_before ?
 					 MAX(0, rel(event->not_before, now)) : 0;
-			j->work = event->budget;
+			j->work = event->pending_budget;
 		} else {
 			j = NULL;
 		}
@@ -250,7 +250,7 @@ static void sim_collect(struct sim *s, uint32_t now)
 			j->remaining = event->budget;
 			j->release = MAX(0, rel(event->future_release, now));
 			j->work = event->budget;
-			j->not_before = j->release;
+			j->not_before = MAX(j->release, rel(event->future_not_before, now));
 			j->deadline = rel((uint32_t)event->future_deadline, now);
 			j->prio = consumer->base.prio;
 			j->cooperative = consumer->base.prio < 0;
@@ -379,10 +379,11 @@ bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint
 	return admission_check(now, NULL, verdict);
 }
 
-void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now)
+void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now, uint32_t budget)
 {
 	if (event->budget != 0U) {
 		event->run_start = now;
+		event->run_budget = budget;
 		event->admission_state = ADMIT_RUNNING;
 	}
 }
@@ -417,6 +418,7 @@ int k_deadline_event_admit(struct k_deadline_event *event, uint32_t release, uin
 	if (event->budget != 0U && event->consumer != NULL) {
 		event->future = false;
 		event->future_release = release;
+		event->future_not_before = not_before;
 		event->future_deadline = deadline;
 		ok = admission_check(now,
 				     &(struct sim_job){

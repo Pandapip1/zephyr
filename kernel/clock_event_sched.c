@@ -833,6 +833,29 @@ uint64_t k_clock_event_sched_now(void)
 	return now;
 }
 
+int k_clock_event_sched_active_target(uint32_t target, uint32_t *count)
+{
+	int ret = -EAGAIN;
+
+	K_SPINLOCK(&sched_lock) {
+		if (deep_provider == NULL || !on_active) {
+			K_SPINLOCK_BREAK;
+		}
+		uint64_t now = now_locked();
+		uint64_t logical = now + (uint64_t)(int64_t)(int32_t)(target - (uint32_t)now);
+
+		/* Before the anchor (a target already passed): the count of now. */
+		*count = to_active(MAX(logical, active_anchor.logical));
+		ret = 0;
+	}
+	return ret;
+}
+
+uint32_t k_clock_event_sched_active_count(void)
+{
+	return provider_now(active_provider);
+}
+
 int k_clock_event_sched_init(struct k_clock_event *event, k_clock_event_handler_t handler,
 			     void *user_data)
 {

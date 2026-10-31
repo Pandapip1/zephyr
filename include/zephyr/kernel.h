@@ -1144,10 +1144,14 @@ struct k_deadline_event {
 	sys_snode_t admission_node;
 	/* Worst-case execution time of one run, cycles; 0 when not admission-controlled. */
 	uint32_t budget;
+	/* Budget of the pending run (k_deadline_event_post_budget()) and of the run in progress. */
+	uint32_t pending_budget;
+	uint32_t run_budget;
 	/* Start of the run in progress. */
 	uint32_t run_start;
 	/* An admitted timed release that has not been posted yet. */
 	uint32_t future_release;
+	uint32_t future_not_before;
 	int future_deadline;
 	uint8_t admission_state;
 	bool future;
@@ -1247,6 +1251,25 @@ __syscall void k_deadline_event_wait(struct k_deadline_event *event);
  * @param deadline Start-by deadline, as for k_deadline_event_post().
  */
 void k_deadline_event_post_at(struct k_deadline_event *event, uint32_t not_before, int deadline);
+
+/**
+ * @brief Post a publication whose run has its own execution budget.
+ *
+ * Like k_deadline_event_post(), for a consumer whose runs differ in length by
+ * the kind of work each publication carries. With admission control, the run
+ * that consumes this publication is admitted with @p budget instead of the
+ * event's budget (k_deadline_event_budget_set()); publications coalesced into
+ * one run keep the largest budget among them. Without admission control the
+ * budget is ignored.
+ *
+ * @isr_ok
+ *
+ * @param event Deadline event to post.
+ * @param deadline Start-by deadline, as for k_deadline_event_post().
+ * @param budget Worst-case execution time of the run, in @ref k_cycle_get_32
+ *               units; 0 for the event's budget.
+ */
+void k_deadline_event_post_budget(struct k_deadline_event *event, int deadline, uint32_t budget);
 
 #if defined(CONFIG_SCHED_DEADLINE_ADMISSION) || defined(__DOXYGEN__)
 /**
