@@ -31,6 +31,7 @@ void z_impl_k_deadline_event_init(struct k_deadline_event *event)
 	k_spinlock_key_t key = z_sched_spinlock_lock();
 
 	event->consumer = NULL;
+	event->deadline = 0;
 	event->pending = false;
 	z_sched_spinlock_unlock(key);
 }
@@ -40,12 +41,18 @@ void z_impl_k_deadline_event_post(struct k_deadline_event *event, int deadline)
 	k_spinlock_key_t key = z_sched_spinlock_lock();
 	struct k_thread *thread = event->consumer;
 
-	/* A set bit is the complete coalescing state; never count publications. */
+	/*
+	 * Never count publications, but keep the earliest deadline among those
+	 * coalesced: the run that consumes them must start by it.
+	 */
+	if (!event->pending || (int32_t)((uint32_t)deadline - (uint32_t)event->deadline) < 0) {
+		event->deadline = deadline;
+	}
 	event->pending = true;
 	if ((thread != NULL) && z_is_thread_suspended(thread) &&
 	    ((thread->base.thread_state & ~_THREAD_SUSPENDED) == 0U)) {
 		/* Assign the EDF key before making the consumer observable as ready. */
-		thread->base.prio_deadline = deadline;
+		thread->base.prio_deadline = event->deadline;
 		z_mark_thread_as_not_suspended(thread);
 		z_sched_ready_locked(thread);
 		z_reschedule_locked(key);
@@ -80,8 +87,16 @@ void z_impl_k_deadline_event_wait(struct k_deadline_event *event)
 		}
 
 		if (event->pending) {
+			int deadline = event->deadline;
+
 			event->pending = false;
 			z_sched_spinlock_unlock(key);
+			/*
+			 * The consumer may have run since its release, and this
+			 * publication may have been latched meanwhile: run it under
+			 * its own deadline, never the key of an earlier run.
+			 */
+			z_sched_current_deadline_update(deadline);
 			return;
 		}
 

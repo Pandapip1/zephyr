@@ -1114,20 +1114,24 @@ __syscall void k_thread_priority_set(k_tid_t thread, int prio);
  * @brief One-bit event latch for a deadline-scheduled persistent thread.
  *
  * A deadline event has one consumer.  Posting coalesces while its event is
- * pending.  The consumer atomically consumes a pending event or suspends
- * itself; posting atomically records the event and, when necessary, releases
- * that suspended consumer with an EDF ordering key.
+ * pending, keeping the earliest deadline of the coalesced publications.  The
+ * consumer atomically consumes a pending event or suspends itself; posting
+ * atomically records the event and, when necessary, releases that suspended
+ * consumer with an EDF ordering key.  Whichever way a publication is
+ * consumed, the consumer then runs under that publication's deadline.
  *
  * The fields are internal.  Initialize with @ref K_DEADLINE_EVENT_DEFINE or
  * @ref k_deadline_event_init before use.
  */
 struct k_deadline_event {
 	struct k_thread *consumer;
+	/* Earliest start-by deadline among the coalesced pending publications. */
+	int deadline;
 	bool pending;
 };
 
 /** @cond INTERNAL_HIDDEN */
-#define Z_DEADLINE_EVENT_INITIALIZER { .consumer = NULL, .pending = false }
+#define Z_DEADLINE_EVENT_INITIALIZER { .consumer = NULL, .deadline = 0, .pending = false }
 /** @endcond */
 
 /**
@@ -1152,13 +1156,15 @@ __syscall void k_deadline_event_init(struct k_deadline_event *event);
  *
  * The first call binds the consumer when it waits.  A post before that time
  * remains latched and is consumed by that first wait.  If the consumer is
- * already ready or running, the event remains latched for its next wait.
+ * already ready or running, the event remains latched for its next wait,
+ * together with the earliest deadline posted since it was last consumed.
  *
  * @isr_ok
  *
  * @param event Deadline event to post.
- * @param deadline Absolute timestamp in @ref k_cycle_get_32 units used if a
- *                 suspended consumer is released.
+ * @param deadline Absolute start-by timestamp in @ref k_cycle_get_32 units:
+ *                 the consumer's EDF key for the run that consumes this
+ *                 publication.
  */
 __syscall void k_deadline_event_post(struct k_deadline_event *event, int deadline);
 
@@ -1177,7 +1183,10 @@ __syscall void k_deadline_event_reset(struct k_deadline_event *event);
  * @brief Consume a pending event or atomically suspend the calling consumer.
  *
  * A deadline event supports exactly one consumer thread.  This routine must
- * be called in thread context.  On return, one posted event was consumed.
+ * be called in thread context.  On return, one posted event was consumed and
+ * the calling thread's EDF key is that publication's deadline.  Consuming a
+ * publication latched while the thread was running is a scheduling point:
+ * an equal-priority thread with an earlier deadline runs first.
  *
  * @param event Deadline event to wait on.
  */

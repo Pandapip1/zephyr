@@ -433,6 +433,28 @@ void z_sched_yield(void)
 	z_swap_locked(key);
 }
 
+#ifdef CONFIG_SCHED_DEADLINE
+void z_sched_current_deadline_update(int deadline)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	if (_current->base.prio_deadline == deadline) {
+		z_sched_spinlock_unlock(key);
+		return;
+	}
+	if (z_is_thread_queued(_current)) {
+		dequeue_thread(_current);
+		_current->base.prio_deadline = deadline;
+		queue_thread(_current);
+	} else {
+		_current->base.prio_deadline = deadline;
+	}
+	/* A scheduling point even for a cooperative thread: it asked to wait. */
+	update_cache(1);
+	z_reschedule(&_sched_spinlock, key);
+}
+#endif /* CONFIG_SCHED_DEADLINE */
+
 /* The scheduler's spinlock must be held */
 static void add_to_waitq_locked(struct k_thread *thread, _wait_q_t *wait_q)
 {

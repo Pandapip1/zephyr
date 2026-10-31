@@ -71,6 +71,51 @@ struct event_priority_post_args {
 	struct k_deadline_event *higher;
 };
 
+#define COALESCED_THREADS 2
+struct k_deadline_event coalesced_events[COALESCED_THREADS];
+K_SEM_DEFINE(coalesced_armed, 0, COALESCED_THREADS);
+struct k_thread coalesced_threads[COALESCED_THREADS];
+K_THREAD_STACK_ARRAY_DEFINE(coalesced_stacks, COALESCED_THREADS, STACK_SIZE);
+volatile int coalesced_runs;
+char coalesced_order[3];
+
+static void coalesced_record(char run)
+{
+	zassert_true(coalesced_runs < (int)ARRAY_SIZE(coalesced_order),
+		     "too many coalesced-deadline runs");
+	coalesced_order[coalesced_runs++] = run;
+}
+
+static void coalesced_first_worker(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	k_sem_give(&coalesced_armed);
+	k_deadline_event_wait(&coalesced_events[0]);
+	coalesced_record('a');
+	/* Latch this thread's next run, due after the job it then releases. */
+	k_deadline_event_post(&coalesced_events[0], K_DEADLINE(MSEC_TO_CYCLES(30)));
+	k_deadline_event_post(&coalesced_events[1], K_DEADLINE(MSEC_TO_CYCLES(20)));
+	/* Consumes the latched run: it is due last, so the other job goes first. */
+	k_deadline_event_wait(&coalesced_events[0]);
+	coalesced_record('A');
+	k_thread_suspend(k_current_get());
+}
+
+static void coalesced_second_worker(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	k_sem_give(&coalesced_armed);
+	k_deadline_event_wait(&coalesced_events[1]);
+	coalesced_record('b');
+	k_thread_suspend(k_current_get());
+}
+
 static void event_latch_post_twice(const void *param)
 {
 	struct k_deadline_event *event = (struct k_deadline_event *)param;
@@ -348,6 +393,42 @@ ZTEST(suite_deadline, test_deadline_event_priority_before_deadline)
 
 	for (int i = 0; i < EVENT_PRIORITY_THREADS; i++) {
 		k_thread_abort(&event_priority_threads[i]);
+	}
+}
+
+/**
+ * @brief Verify a publication latched while its consumer runs keeps its deadline.
+ *
+ * A running consumer posts its own next run, due in 30 ms, then releases an
+ * equal-priority job due in 20 ms, which cannot preempt it. Consuming the
+ * latched run must apply that run's 30 ms deadline, not keep the key of the
+ * run that just finished, so the 20 ms job runs first.
+ */
+ZTEST(suite_deadline, test_deadline_event_latched_run_keeps_its_deadline)
+{
+	static const k_thread_entry_t entries[COALESCED_THREADS] = {
+		coalesced_first_worker, coalesced_second_worker,
+	};
+
+	coalesced_runs = 0;
+	k_sem_reset(&coalesced_armed);
+	for (int i = 0; i < COALESCED_THREADS; i++) {
+		k_deadline_event_init(&coalesced_events[i]);
+		(void)k_thread_create(&coalesced_threads[i], coalesced_stacks[i], STACK_SIZE,
+				      entries[i], NULL, NULL, NULL,
+				      K_HIGHEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
+	}
+	for (int i = 0; i < COALESCED_THREADS; i++) {
+		k_sem_take(&coalesced_armed, K_FOREVER);
+	}
+	k_deadline_event_post(&coalesced_events[0], K_DEADLINE(MSEC_TO_CYCLES(10)));
+	k_sleep(K_MSEC(1));
+
+	zassert_equal(coalesced_runs, 3, "not every run happened");
+	zassert_mem_equal(coalesced_order, "abA", 3,
+			  "a latched run kept the earlier run's deadline");
+	for (int i = 0; i < COALESCED_THREADS; i++) {
+		k_thread_abort(&coalesced_threads[i]);
 	}
 }
 

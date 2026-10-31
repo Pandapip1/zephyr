@@ -152,6 +152,13 @@ void z_sched_unready_locked(struct k_thread *thread);
  */
 void z_sched_yield(void);
 
+/*
+ * Set the current thread's EDF key, then switch if an equal-priority thread
+ * now orders first (ties go to the other thread, like a yield), even when
+ * the current thread is cooperative.
+ */
+void z_sched_current_deadline_update(int deadline);
+
 static inline void z_reschedule_unlocked(void)
 {
 	(void) z_reschedule_irqlock(arch_irq_lock());
