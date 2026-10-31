@@ -74,7 +74,14 @@ SECTION_SUBSEC_FUNC(exc_vector_table,_vector_table_section,_vector_table)
 #else
 #error Unknown ARM architecture
 #endif /* CONFIG_ARMV6_M_ARMV8_M_BASELINE */
-    .word 0
+    /*
+     * Reserved slot 13. Some bootloaders read a pointer to an image
+     * descriptor here (e.g. the Silicon Labs Gecko Bootloader's
+     * ApplicationProperties_t). An image provides one by defining
+     * z_arm_vector_reserved_13; left undefined, the weak reference is 0.
+     */
+    .weak z_arm_vector_reserved_13
+    .word z_arm_vector_reserved_13
 #if defined(CONFIG_MULTITHREADING) && !defined(CONFIG_USE_SWITCH)
     .word z_arm_pendsv
 #else
