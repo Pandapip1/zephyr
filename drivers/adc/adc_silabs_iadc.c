@@ -95,6 +95,14 @@ struct iadc_data {
 	atomic_t sampling;         /* Set while a sampling is waiting to be completed */
 	uint32_t pending_channels; /* Channels of the current sampling not yet converted */
 	uint8_t *sample_ptr;       /* Where the next result of the current sampling goes */
+	/* What iadc_set_config() last programmed, valid while configured is set: a read with the
+	 * same channels and conversion settings starts without re-initialising the converter.
+	 */
+	bool configured;
+	uint32_t configured_channels;
+	uint8_t configured_alignment;
+	uint8_t configured_oversampling;
+	uint8_t configured_digital_averaging;
 };
 
 struct iadc_config {
@@ -264,6 +272,8 @@ static bool iadc_sampling_end(const struct device *dev)
 
 static void iadc_sampling_failed(struct iadc_data *data, int status)
 {
+	/* The FIFO may still hold results of the failed sampling: re-initialise next time. */
+	data->configured = false;
 	/* Unlike adc_context_on_sampling_done(), adc_context_complete() leaves the timer of a
 	 * sequence with an interval running.
 	 */
@@ -551,9 +561,21 @@ static int start_read(const struct device *dev, const struct adc_sequence *seque
 
 	data->channels = sequence->channels;
 
-	res = iadc_set_config(data->dev);
-	if (res < 0) {
-		return res;
+	/* sl_hal_iadc_init() disables and reprograms the converter: only when something changed. */
+	if (!data->configured || data->configured_channels != data->channels ||
+	    data->configured_alignment != data->alignment ||
+	    data->configured_oversampling != data->oversampling ||
+	    data->configured_digital_averaging != data->digital_averaging) {
+		data->configured = false;
+		res = iadc_set_config(data->dev);
+		if (res < 0) {
+			return res;
+		}
+		data->configured = true;
+		data->configured_channels = data->channels;
+		data->configured_alignment = data->alignment;
+		data->configured_oversampling = data->oversampling;
+		data->configured_digital_averaging = data->digital_averaging;
 	}
 
 	adc_context_start_read(&data->ctx, sequence);
@@ -721,6 +743,7 @@ static int iadc_channel_setup(const struct device *dev, const struct adc_channel
 	}
 
 	chan_conf->initialized = false;
+	data->configured = false;
 
 	chan_conf->pos_port = (channel_cfg->input_positive & IADC_PORT_MASK) >> 4;
 	chan_conf->pos_pin = channel_cfg->input_positive & IADC_PIN_MASK;
@@ -783,7 +806,10 @@ static int iadc_channel_setup(const struct device *dev, const struct adc_channel
 static int iadc_pm_action(const struct device *dev, enum pm_device_action action)
 {
 	const struct iadc_config *config = dev->config;
+	struct iadc_data *data = dev->data;
 	int err;
+
+	data->configured = false;
 
 	if (action == PM_DEVICE_ACTION_RESUME) {
 		err = clock_control_on(config->clock_dev,
