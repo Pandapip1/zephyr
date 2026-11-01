@@ -13,7 +13,31 @@
 
 #define STACK_SIZE (1024 + CONFIG_TEST_EXTRA_STACK_SIZE)
 
-#define US(us) ((uint32_t)k_us_to_cyc_ceil32(us))
+/*
+ * Time scale of the cases. Every time below is written for a target on which a
+ * release reaches its consumer quickly; the tightest window around a job that
+ * really runs is 100 us (a release due 100 us after it is posted). Getting from
+ * a release to the consumer's first instruction (the releasing interrupt, the
+ * admission checks in it, the context switch) is not counted by admission:
+ * CONFIG_SCHED_DEADLINE_ADMISSION_BLOCKING_NS is 0 here, so the cases assume
+ * that latency is small against their windows. It is not on every target: on
+ * mps2/an385 under QEMU (-icount shift=7, 128 ns per instruction, 25 MHz cycle
+ * counter) it is above 100 us, and admitted jobs start late. setup() measures
+ * the latency on the target and multiplies every time in the cases by @ref
+ * scale, keeping the latency within 1/LATENCY_SHARE of the tightest window.
+ */
+#define TIGHTEST_WINDOW_US 100U
+#define LATENCY_SHARE      4U
+#define CALIBRATION_RUNS   8
+
+static uint32_t scale = 1U;
+
+#define US(us) ((uint32_t)k_us_to_cyc_ceil32((uint64_t)(us) * scale))
+
+static void sleep_ms(uint32_t ms)
+{
+	k_sleep(K_USEC(ms * USEC_PER_MSEC * scale));
+}
 
 /* Two meta-IRQ levels, as a radio's jobs above an upper link layer. */
 #define PRIO_HIGH K_HIGHEST_THREAD_PRIO
@@ -63,6 +87,46 @@ static void job(void *p1, void *p2, void *p3)
 	}
 }
 
+static void budget(enum job_id id, uint32_t us);
+
+/* Release-to-start time of the path most cases use; set by post_calibration(). */
+static uint32_t calibration_release;
+
+/* As post_with_budget(): two admitted releases in one interrupt, the second measured. */
+static void post_calibration(const void *param)
+{
+	uint32_t now = k_cycle_get_32();
+
+	ARG_UNUSED(param);
+	calibration_release = now;
+	k_deadline_event_post(&events[JOB_HIGH2], (int)(now + US(USEC_PER_SEC)));
+	k_deadline_event_post(&events[JOB_HIGH], (int)(now + US(USEC_PER_SEC)));
+}
+
+/*
+ * Measure, at scale 1, the longest time from an interrupt that releases two admitted jobs to
+ * the start of the second, and set @ref scale from it.
+ */
+static void calibrate(void)
+{
+	uint32_t worst = 0U;
+	uint32_t worst_us;
+
+	budget(JOB_HIGH, 10U);
+	budget(JOB_HIGH2, 10U);
+	for (int i = 0; i < CALIBRATION_RUNS; i++) {
+		int before_runs = runs[JOB_HIGH];
+
+		irq_offload(post_calibration, NULL);
+		sleep_ms(10U);
+		zassert_equal(runs[JOB_HIGH], before_runs + 1, "calibration release did not run");
+		worst = MAX(worst, started_at[JOB_HIGH] - calibration_release);
+	}
+	worst_us = (uint32_t)k_cyc_to_us_ceil32(worst);
+	scale = MAX(1U, DIV_ROUND_UP(worst_us * LATENCY_SHARE, TIGHTEST_WINDOW_US));
+	TC_PRINT("release to start %u us: times scaled by %u\n", worst_us, scale);
+}
+
 static void *setup(void)
 {
 	static const int prios[JOBS] = {PRIO_HIGH, PRIO_HIGH, PRIO_LOW};
@@ -78,7 +142,8 @@ static void *setup(void)
 		k_sem_take(&armed, K_FOREVER);
 	}
 	/* Let every consumer reach its wait. */
-	k_sleep(K_MSEC(1));
+	sleep_ms(1U);
+	calibrate();
 	return NULL;
 }
 
@@ -98,7 +163,7 @@ static void after(void *fixture)
 {
 	ARG_UNUSED(fixture);
 	/* Let released jobs finish before the next case. */
-	k_sleep(K_MSEC(5));
+	sleep_ms(5U);
 }
 
 /* Several releases in one interrupt: each is checked with the earlier ones pending. */
@@ -132,7 +197,7 @@ static void release_in_irq(const struct release *list, size_t count)
 
 static void budget(enum job_id id, uint32_t us)
 {
-	run_us[id] = us;
+	run_us[id] = us * scale;
 	k_deadline_event_budget_set(&events[id], US(us));
 }
 
@@ -143,7 +208,7 @@ ZTEST(deadline_admission, test_feasible_release_is_admitted)
 
 	budget(JOB_HIGH, 100U);
 	release_in_irq(r, ARRAY_SIZE(r));
-	k_sleep(K_MSEC(2));
+	sleep_ms(2U);
 	zassert_equal(runs[JOB_HIGH], 1);
 	zassert_equal(misses, 0, "a feasible release was reported");
 }
@@ -164,7 +229,7 @@ ZTEST(deadline_admission, test_higher_priority_release_sacrifices_lower)
 	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
 	zassert_equal_ptr(last_miss.object, &events[JOB_LOW], "the lower priority is sacrificed");
 	zassert_true(last_miss.demand >= US(500U), "the higher job's work is ahead of it");
-	k_sleep(K_MSEC(2));
+	sleep_ms(2U);
 	zassert_true((int32_t)(started_at[JOB_HIGH] - last_miss.now) >= 0,
 		     "reported before the admitted job ran");
 }
@@ -229,11 +294,11 @@ static void running_job(void *p1, void *p2, void *p3)
 		inside_misses[0] = misses - inside_misses[0];
 		/* Let the released job run, then try again 800 us into a fresh run. */
 		k_deadline_event_wait(&events[JOB_HIGH2]);
-		k_busy_wait(800U);
+		k_busy_wait(800U * scale);
 		inside_misses[1] = misses;
 		irq_offload(post_high, NULL);
 		inside_misses[1] = misses - inside_misses[1];
-		k_busy_wait(200U);
+		k_busy_wait(200U * scale);
 	}
 }
 
@@ -249,16 +314,16 @@ ZTEST(deadline_admission, test_running_job_counts_its_remaining_budget)
 			      NULL,
 			      PRIO_HIGH, 0, K_NO_WAIT);
 	k_sem_take(&armed, K_FOREVER);
-	k_sleep(K_MSEC(1));
+	sleep_ms(1U);
 
 	budget(JOB_HIGH2, 1000U);
 	budget(JOB_HIGH, 10U);
 	k_deadline_event_post(&events[JOB_HIGH2], (int)(k_cycle_get_32() + US(100U)));
-	k_sleep(K_MSEC(3));
+	sleep_ms(3U);
 	zassert_equal(inside_misses[0], 1, "a full remaining budget ahead was not unsat");
 	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH]);
 	k_deadline_event_post(&events[JOB_HIGH2], (int)(k_cycle_get_32() + US(100U)));
-	k_sleep(K_MSEC(3));
+	sleep_ms(3U);
 	zassert_equal(inside_misses[1], 0, "the elapsed part of the run was counted");
 	k_thread_abort(&running_thread);
 }
@@ -274,7 +339,7 @@ ZTEST(deadline_admission, test_post_at_starts_at_its_instant)
 
 	budget(JOB_HIGH, 10U);
 	k_deadline_event_post_at(&events[JOB_HIGH], not_before, (int)(not_before + US(100U)));
-	k_sleep(K_MSEC(1));
+	sleep_ms(1U);
 	zassert_equal(runs[JOB_HIGH], 1);
 	zassert_true((int32_t)(started_at[JOB_HIGH] - not_before) >= 0, "started early");
 	zassert_true((int32_t)(started_at[JOB_HIGH] - (not_before + US(100U))) <= 0,
@@ -429,7 +494,7 @@ ZTEST(deadline_admission, test_publication_budget)
 	budget(JOB_HIGH, 50U);
 	budget_post_us = 100U;
 	irq_offload(post_with_budget, NULL);
-	k_sleep(K_MSEC(2));
+	sleep_ms(2U);
 	zassert_equal(misses, 0, "a short publication was reported");
 
 	budget_post_us = 650U;
