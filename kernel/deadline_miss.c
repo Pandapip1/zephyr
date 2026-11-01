@@ -17,6 +17,8 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/printk.h>
 
+#include <kthread.h>
+
 static atomic_t miss_count;
 static struct k_spinlock history_lock;
 /* The most recent job runs, oldest overwritten first. */
@@ -36,8 +38,22 @@ void z_deadline_miss_job_start(const struct k_deadline_event *event, uint32_t no
 
 /* Snapshot of the runs that overlap a reported failure. */
 static struct k_deadline_miss_run snapshot[CONFIG_SCHED_DEADLINE_MISS_HISTORY];
-/* A report is being handled; a failure detected meanwhile is only counted. */
-static atomic_t reporting;
+
+/*
+ * The report that owns the snapshot. It owns it until the policy returns, or
+ * until the thread that made it is suspended or aborted: a policy commonly
+ * stops the thread whose job missed, from inside the report, and that report
+ * is then over although its call never returns. A report made while the owner
+ * is live (from an interrupt that preempted it, from the policy itself, or
+ * while the owner is preempted or blocked) is nested: it reaches the policy
+ * too, without a run history.
+ */
+static struct k_spinlock report_lock;
+static bool reporting;
+/* Thread that made the owning report, or NULL for an interrupt. */
+static struct k_thread *reporter;
+/* Advanced by every owning report, so that an abandoned one cannot end its successor. */
+static uint32_t report_generation;
 
 /* Copy the runs that started in [release, now] into the snapshot, oldest first. */
 static void history_fill(struct k_deadline_miss *miss)
@@ -128,13 +144,32 @@ uint32_t k_deadline_miss_count(void)
 	return (uint32_t)atomic_get(&miss_count);
 }
 
+/* The owning report's thread was stopped inside it and cannot finish it. */
+static bool report_abandoned(void)
+{
+	return (reporter != NULL) && (z_is_thread_suspended(reporter) || z_is_thread_dead(reporter));
+}
+
 void z_deadline_miss_report(struct k_deadline_miss *miss)
 {
+	bool owner = false;
+	uint32_t generation = 0U;
+
 	(void)atomic_inc(&miss_count);
-	if (!atomic_cas(&reporting, 0, 1)) {
-		return;
+	K_SPINLOCK(&report_lock) {
+		if (!reporting || report_abandoned()) {
+			owner = true;
+			reporting = true;
+			reporter = k_is_in_isr() ? NULL : _current;
+			generation = ++report_generation;
+		}
 	}
-	history_fill(miss);
+	if (owner) {
+		history_fill(miss);
+	} else {
+		miss->ran_count = 0U;
+		miss->ran = snapshot;
+	}
 	if (IS_ENABLED(CONFIG_SCHED_DEADLINE_MISS_PANIC)) {
 		/* Print synchronously: the report must not depend on deferred logging. */
 		LOG_PANIC();
@@ -144,5 +179,12 @@ void z_deadline_miss_report(struct k_deadline_miss *miss)
 #ifdef CONFIG_SCHED_DEADLINE_MISS_CUSTOM
 	k_deadline_miss_handler(miss);
 #endif
-	atomic_set(&reporting, 0);
+	if (owner) {
+		K_SPINLOCK(&report_lock) {
+			/* A resumed reporter whose report was taken over leaves the new one alone. */
+			if (report_generation == generation) {
+				reporting = false;
+			}
+		}
+	}
 }

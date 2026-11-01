@@ -63,13 +63,38 @@ static volatile int runs[JOBS];
 static struct k_deadline_miss last_miss;
 static volatile int misses;
 
+/* What the policy was handed in each of the first two reports of a case. */
+static const void *volatile reported_object[2];
+static volatile uint8_t reported_ran_count[2];
+
+/* Set by a case: the policy stops the thread it runs on, as a shutdown policy does. */
+static volatile bool policy_suspends_reporter;
+static struct k_thread *volatile suspended_reporter;
+/* Set by a case: the policy's own work leads to another failure, found in an interrupt. */
+static volatile bool policy_fails_in_irq;
+
+static void report_unsat_in_irq(const void *param);
+
 /* The first report since the case began: a late start may follow an unsat one. */
 void k_deadline_miss_handler(const struct k_deadline_miss *miss)
 {
 	if (misses == 0) {
 		last_miss = *miss;
 	}
+	if (misses < ARRAY_SIZE(reported_object)) {
+		reported_object[misses] = miss->object;
+		reported_ran_count[misses] = miss->ran_count;
+	}
 	misses++;
+	if (policy_fails_in_irq) {
+		policy_fails_in_irq = false;
+		irq_offload(report_unsat_in_irq, NULL);
+	}
+	if (policy_suspends_reporter && !k_is_in_isr()) {
+		policy_suspends_reporter = false;
+		suspended_reporter = k_current_get();
+		k_thread_suspend(k_current_get());
+	}
 }
 
 static void job(void *p1, void *p2, void *p3)
@@ -157,6 +182,10 @@ static void before(void *fixture)
 		k_deadline_event_admit_cancel(&events[i]);
 	}
 	misses = 0;
+	reported_object[0] = NULL;
+	reported_object[1] = NULL;
+	policy_suspends_reporter = false;
+	policy_fails_in_irq = false;
 }
 
 static void after(void *fixture)
@@ -523,6 +552,87 @@ ZTEST(deadline_admission, test_future_release_keeps_not_before)
 	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH2]);
 	k_deadline_event_admit_cancel(&events[JOB_HIGH]);
 	k_deadline_event_admit_cancel(&events[JOB_HIGH2]);
+}
+
+/* Report @p id unsat from the calling context: a release that cannot start by its deadline. */
+static void report_unsat(enum job_id id)
+{
+	uint32_t now = k_cycle_get_32();
+
+	(void)k_deadline_event_admit(&events[id], now + US(500U), now + US(500U),
+				     (int)(now + US(400U)));
+}
+
+static void report_unsat_in_irq(const void *param)
+{
+	ARG_UNUSED(param);
+	report_unsat(JOB_LOW);
+}
+
+static struct k_thread reporter_thread;
+static K_THREAD_STACK_DEFINE(reporter_stack, STACK_SIZE);
+static volatile bool reporter_returned;
+
+static void reporter(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+	report_unsat(JOB_HIGH);
+	reporter_returned = true;
+}
+
+/*
+ * A policy that suspends the thread it was called on, inside the report, ends that report:
+ * a failure found afterwards in another thread still reaches the policy, with its run history.
+ */
+ZTEST(deadline_admission, test_policy_suspending_its_reporter_sees_later_failures)
+{
+	budget(JOB_HIGH, 50U);
+	budget(JOB_LOW, 50U);
+	policy_suspends_reporter = true;
+	reporter_returned = false;
+	(void)k_thread_create(&reporter_thread, reporter_stack, STACK_SIZE, reporter, NULL, NULL,
+			      NULL, K_PRIO_COOP(0), 0, K_NO_WAIT);
+	sleep_ms(1U);
+	zassert_equal(misses, 1);
+	zassert_equal_ptr(suspended_reporter, &reporter_thread, "the policy ran on the reporter");
+	zassert_false(reporter_returned);
+
+	report_unsat(JOB_LOW);
+	zassert_equal(misses, 2, "a failure after a suspended report did not reach the policy");
+	zassert_equal_ptr(reported_object[1], &events[JOB_LOW]);
+
+	/* Resumed, the first reporter finishes its report without ending a later one. */
+	k_thread_resume(&reporter_thread);
+	k_thread_join(&reporter_thread, K_FOREVER);
+	zassert_true(reporter_returned);
+	report_unsat(JOB_HIGH);
+	zassert_equal(misses, 3, "a failure after a resumed reporter did not reach the policy");
+	k_deadline_event_admit_cancel(&events[JOB_HIGH]);
+	k_deadline_event_admit_cancel(&events[JOB_LOW]);
+}
+
+/*
+ * A failure found while the policy handles another, here in an interrupt the policy's own
+ * work raises, is nested: it reaches the policy too, without a run history.
+ */
+ZTEST(deadline_admission, test_failure_during_a_report_reaches_the_policy)
+{
+	budget(JOB_HIGH, 50U);
+	budget(JOB_LOW, 50U);
+	policy_fails_in_irq = true;
+	report_unsat(JOB_HIGH);
+	zassert_equal(misses, 2, "the nested failure did not reach the policy");
+	zassert_equal_ptr(reported_object[0], &events[JOB_HIGH]);
+	zassert_equal_ptr(reported_object[1], &events[JOB_LOW]);
+	zassert_equal(reported_ran_count[1], 0U, "a nested report has no run history");
+
+	/* The outer report has ended: the next failure owns the history again. */
+	report_unsat(JOB_HIGH);
+	zassert_equal(misses, 3);
+	k_deadline_event_admit_cancel(&events[JOB_HIGH]);
+	k_deadline_event_admit_cancel(&events[JOB_LOW]);
 }
 
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);

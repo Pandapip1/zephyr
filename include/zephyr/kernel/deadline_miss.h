@@ -90,6 +90,13 @@ struct k_deadline_miss {
  * (often an interrupt) for an infeasible release. It must therefore be
  * interrupt-safe. It may return, in which case the job proceeds.
  *
+ * Every failure reaches the policy, including one detected while an earlier
+ * report is still being handled (by an interrupt that preempted the policy, or
+ * by the policy itself); such a nested report has no run history
+ * (@ref k_deadline_miss.ran_count is 0). The policy may suspend or abort the
+ * thread it was called on, also inside the call: that report then ends, and
+ * the run history it was given may be reused by the next one.
+ *
  * @param miss Description of the failure; valid only during the call.
  */
 void k_deadline_miss_handler(const struct k_deadline_miss *miss);
