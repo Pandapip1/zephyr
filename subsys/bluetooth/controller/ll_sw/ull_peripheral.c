@@ -616,6 +616,13 @@ uint8_t ll_start_enc_req_send(uint16_t handle, uint8_t error_code,
 		return BT_HCI_ERR_UNKNOWN_CONN_ID;
 	}
 
+	if (IS_ENABLED(CONFIG_BT_CTLR_LE_ENC_POLICY) && !error_code &&
+	    !ll_enc_policy_permitted()) {
+		/* The procedure must still end: refuse the key. */
+		(void)ull_cp_ltk_req_neq_reply(conn);
+		return BT_HCI_ERR_ENC_MODE_NOT_ACCEPTABLE;
+	}
+
 	if (error_code) {
 		return ull_cp_ltk_req_neq_reply(conn);
 	} else {

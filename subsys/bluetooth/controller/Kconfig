@@ -559,6 +559,20 @@ config BT_CTLR_LE_ENC
 	  Enable support for Bluetooth v4.0 LE Encryption feature in the
 	  Controller.
 
+config BT_CTLR_LE_ENC_POLICY
+	bool
+	depends on BT_CTLR_LE_ENC
+	help
+	  The Controller asks ll_enc_policy_permitted(), implemented outside
+	  the Controller (for example by its radio driver), before starting
+	  encryption on a connection. While it returns false, the Host's LE
+	  Enable Encryption and LE Long Term Key Request Reply fail with
+	  Encryption Mode Not Acceptable (0x25), and a peer's LL_ENC_REQ is
+	  answered with LL_REJECT_EXT_IND (or LL_REJECT_IND) carrying
+	  Unsupported Remote Feature (0x1A), as for a Link Layer without
+	  encryption (Core v6.1 Vol 6 Part B 5.1.3.1). For operation under
+	  rules that prohibit encryption, such as amateur radio.
+
 config BT_CTLR_ECDH
 	bool "Elliptic Curve Diffie-Hellman (ECDH)"
 	depends on BT_CTLR_ECDH_SUPPORT

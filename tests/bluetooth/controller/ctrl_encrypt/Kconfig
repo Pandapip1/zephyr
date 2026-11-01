@@ -26,6 +26,10 @@ config ENTROPY_NRF_FORCE_ALT
 config ENTROPY_NRF5_RNG
 	default n
 
+config TEST_BT_CTLR_LE_ENC_POLICY
+	bool "Test the run-time encryption policy hook"
+	select BT_CTLR_LE_ENC_POLICY
+
 source "tests/bluetooth/controller/common/Kconfig"
 
 # Include Zephyr's Kconfig

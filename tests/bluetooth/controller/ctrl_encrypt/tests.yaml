@@ -6,3 +6,7 @@ common:
 tests:
   bluetooth.controller.ctrl_encrypt.test:
     type: unit
+  bluetooth.controller.ctrl_encrypt.policy:
+    type: unit
+    extra_configs:
+      - CONFIG_TEST_BT_CTLR_LE_ENC_POLICY=y

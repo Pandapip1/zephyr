@@ -2704,6 +2704,129 @@ ZTEST(encryption_pause, test_encryption_pause_periph_rem_invalid)
 		      "Free CTX buffers %d", llcp_ctx_buffers_free());
 }
 
+/* CONFIG_BT_CTLR_LE_ENC_POLICY: whether the policy currently permits encryption. */
+static bool enc_policy_permit = true;
+
+bool ll_enc_policy_permitted(void)
+{
+	return enc_policy_permit;
+}
+
+static void enc_policy_teardown(void *data)
+{
+	enc_policy_permit = true;
+}
+
+/* +-----+                +-------+              +-----+
+ * | UT  |                | LL_A  |              | LT  |
+ * +-----+                +-------+              +-----+
+ *    |                       |                     |
+ *    |   Encryption not      |          LL_ENC_REQ |
+ *    |   permitted           |<--------------------|
+ *    |                       |                     |
+ *    |                       | LL_REJECT_EXT_IND   |
+ *    |                       | (0x1A)              |
+ *    |                       |-------------------->|
+ *    |                       |                     |
+ */
+ZTEST(encryption_policy, test_encryption_start_periph_rem_not_permitted)
+{
+	struct node_tx *tx;
+
+	struct pdu_data_llctrl_enc_req enc_req = {
+		.rand = { RAND },
+		.ediv = { EDIV },
+		.skdm = { SKDM },
+		.ivm = { IVM },
+	};
+
+	/* As a Link Layer without encryption: Core v6.1 Vol 6 Part B 5.1.3.1. */
+	struct pdu_data_llctrl_reject_ext_ind reject_ext_ind = {
+		.reject_opcode = PDU_DATA_LLCTRL_TYPE_ENC_REQ,
+		.error_code = BT_HCI_ERR_UNSUPP_REMOTE_FEATURE
+	};
+
+	Z_TEST_SKIP_IFNDEF(CONFIG_BT_CTLR_LE_ENC_POLICY);
+
+	enc_policy_permit = false;
+
+	/* Role */
+	test_set_role(&conn, BT_HCI_ROLE_PERIPHERAL);
+
+	/* Connect */
+	ull_cp_state_set(&conn, ULL_CP_CONNECTED);
+
+	/* Prepare */
+	event_prepare(&conn);
+
+	/* Rx */
+	lt_tx(LL_ENC_REQ, &conn, &enc_req);
+
+	/* Done */
+	event_done(&conn);
+
+	/* Prepare */
+	event_prepare(&conn);
+
+	/* The reject, no LL_ENC_RSP: no session key material leaves the Link Layer */
+	lt_rx(LL_REJECT_EXT_IND, &conn, &tx, &reject_ext_ind);
+	lt_rx_q_is_empty(&conn);
+
+	/* No random numbers were drawn for SKDs/IVs */
+	zassert_equal(lll_csrand_get_fake.call_count, 0, "SKD/IV generated");
+
+	/* Done */
+	event_done(&conn);
+
+	/* Data flows again, unencrypted */
+	CHECK_RX_PE_STATE(conn, RESUMED, UNENCRYPTED);
+	CHECK_TX_PE_STATE(conn, RESUMED, UNENCRYPTED);
+
+	/* Release Tx */
+	ull_cp_release_tx(&conn, tx);
+
+	/* The Host is not asked for a key */
+	ut_rx_q_is_empty();
+
+	zassert_equal(llcp_ctx_buffers_free(), test_ctx_buffers_cnt(),
+		      "Free CTX buffers %d", llcp_ctx_buffers_free());
+}
+
+/* With the policy permitting, the procedure is unchanged: LL_ENC_RSP follows LL_ENC_REQ. */
+ZTEST(encryption_policy, test_encryption_start_periph_rem_permitted)
+{
+	struct node_tx *tx;
+
+	struct pdu_data_llctrl_enc_req enc_req = {
+		.rand = { RAND },
+		.ediv = { EDIV },
+		.skdm = { SKDM },
+		.ivm = { IVM },
+	};
+
+	struct pdu_data_llctrl_enc_rsp exp_enc_rsp = {
+		.skds = { SKDS },
+		.ivs = { IVS },
+	};
+
+	lll_csrand_get_fake.return_val = sizeof(exp_enc_rsp.skds) + sizeof(exp_enc_rsp.ivs);
+	lll_csrand_get_custom_fake_context.buf = exp_enc_rsp.skds;
+	lll_csrand_get_custom_fake_context.len = sizeof(exp_enc_rsp.skds) + sizeof(exp_enc_rsp.ivs);
+
+	test_set_role(&conn, BT_HCI_ROLE_PERIPHERAL);
+	ull_cp_state_set(&conn, ULL_CP_CONNECTED);
+
+	event_prepare(&conn);
+	lt_tx(LL_ENC_REQ, &conn, &enc_req);
+	event_done(&conn);
+
+	event_prepare(&conn);
+	lt_rx(LL_ENC_RSP, &conn, &tx, &exp_enc_rsp);
+	lt_rx_q_is_empty(&conn);
+	event_done(&conn);
+	ull_cp_release_tx(&conn, tx);
+}
 
 ZTEST_SUITE(encryption_start, NULL, NULL, enc_setup, NULL, NULL);
 ZTEST_SUITE(encryption_pause, NULL, NULL, enc_setup, NULL, NULL);
+ZTEST_SUITE(encryption_policy, NULL, NULL, enc_setup, enc_policy_teardown, NULL);

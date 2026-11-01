@@ -556,6 +556,10 @@ uint8_t ll_enc_req_send(uint16_t handle, uint8_t const *const rand_num,
 		return BT_HCI_ERR_UNKNOWN_CONN_ID;
 	}
 
+	if (IS_ENABLED(CONFIG_BT_CTLR_LE_ENC_POLICY) && !ll_enc_policy_permitted()) {
+		return BT_HCI_ERR_ENC_MODE_NOT_ACCEPTABLE;
+	}
+
 #if defined(CONFIG_BT_CTLR_CENTRAL_ISO)
 	struct ll_conn_iso_stream *cis = ll_conn_iso_stream_get_by_acl(conn, NULL);
 

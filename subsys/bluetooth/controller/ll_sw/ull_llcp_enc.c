@@ -863,8 +863,10 @@ static void rp_enc_send_reject_ind(struct ll_conn *conn, struct proc_ctx *ctx, u
 		llcp_rp_enc_tx(conn, ctx, PDU_DATA_LLCTRL_TYPE_REJECT_IND);
 		llcp_rr_complete(conn);
 
-		if (ctx->data.enc.error == BT_HCI_ERR_PIN_OR_KEY_MISSING) {
-			/* Start encryption rejected due to missing key.
+		if (ctx->data.enc.error == BT_HCI_ERR_PIN_OR_KEY_MISSING ||
+		    ctx->data.enc.error == BT_HCI_ERR_UNSUPP_REMOTE_FEATURE) {
+			/* Start encryption rejected due to missing key, or because
+			 * encryption is not permitted (BT_CTLR_LE_ENC_POLICY).
 			 *
 			 * Resume paused data and local procedures.
 			 */
@@ -961,6 +963,17 @@ static void rp_enc_state_wait_rx_enc_req(struct ll_conn *conn, struct proc_ctx *
 		llcp_lr_pause(conn);
 
 		rp_enc_store_m(conn, ctx, param);
+
+		if (IS_ENABLED(CONFIG_BT_CTLR_LE_ENC_POLICY) && !ll_enc_policy_permitted()) {
+			/* As a Link Layer without encryption (Core v6.1 Vol 6 Part B
+			 * 5.1.3.1): reject with Unsupported Remote Feature.
+			 */
+			ctx->data.enc.error = BT_HCI_ERR_UNSUPP_REMOTE_FEATURE;
+			ctx->reject_ext_ind.reject_opcode = PDU_DATA_LLCTRL_TYPE_ENC_REQ;
+			ctx->reject_ext_ind.error_code = BT_HCI_ERR_UNSUPP_REMOTE_FEATURE;
+			rp_enc_send_reject_ind(conn, ctx, evt, param);
+			break;
+		}
 
 		rp_enc_send_enc_rsp(conn, ctx, evt, param);
 		break;

@@ -246,6 +246,8 @@ uint8_t ll_enc_req_send(uint16_t handle, uint8_t const *const rand_num, uint8_t 
 			uint8_t const *const ltk);
 uint8_t ll_start_enc_req_send(uint16_t handle, uint8_t err_code,
 			   uint8_t const *const ltk);
+/* With CONFIG_BT_CTLR_LE_ENC_POLICY: whether encryption may start now. */
+bool ll_enc_policy_permitted(void);
 uint8_t ll_req_peer_sca(uint16_t handle);
 uint8_t ll_feature_req_send(uint16_t handle);
 uint8_t ll_version_ind_send(uint16_t handle);
