@@ -17,7 +17,7 @@
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/kernel/clock_event.h>
-#include <zephyr/sys_clock.h>
+#include <zephyr/sys/clock.h>
 
 BUILD_ASSERT(CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC == CONFIG_CLOCK_EVENT_SCHED_FREQUENCY,
 	     "hardware cycles must be the scheduler clock service's timebase");
