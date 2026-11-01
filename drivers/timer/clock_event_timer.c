@@ -43,13 +43,16 @@ static void arm(uint64_t now, uint32_t ticks)
 	uint64_t deadline = announced + (elapsed + ticks) * CYC_PER_TICK;
 
 	/*
-	 * A deadline inside the service's minimum lead cannot be armed; deliver
-	 * it as soon as the service can rather than drop it.
+	 * A tick boundary inside the service's minimum lead is refused, and so is
+	 * one the clock passes while the arm runs: the service reads the clock
+	 * again after the lead check, and a read costs time. Either way nothing
+	 * would be armed and the kernel would never be announced to again. Arm
+	 * the first later boundary the service accepts instead: announcements
+	 * fall on tick boundaries and a timeout may expire late, never early.
+	 * Each refusal costs less than a tick, so this ends.
 	 */
-	if (k_clock_event_arm_abs(&timeout_event, (uint32_t)deadline) != 0) {
-		(void)k_clock_event_arm_abs(&timeout_event,
-					    (uint32_t)k_clock_event_sched_now() +
-					    k_clock_event_min_arm_cycles(&timeout_event) + 1U);
+	while (k_clock_event_arm_abs(&timeout_event, (uint32_t)deadline) != 0) {
+		deadline += CYC_PER_TICK;
 	}
 }
 
