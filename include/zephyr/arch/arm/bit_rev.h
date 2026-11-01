@@ -9,7 +9,6 @@
 
 #ifndef _ASMLANGUAGE
 
-#include <arm_acle.h>
 #include <zephyr/types.h>
 #include <zephyr/sys/util.h>
 
@@ -35,7 +34,8 @@ extern "C" {
  */
 static inline uint32_t arch_sys_bit_rev32(uint32_t x)
 {
-	return __rbit(x);
+	__asm__("rbit %0, %1" : "=r"(x) : "r"(x));
+	return x;
 }
 
 /**
