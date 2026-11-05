@@ -213,7 +213,7 @@ struct z_shared_isr_table_entry z_shared_sw_isr_table[];
  * Used by Z_ISR_DECLARE and ISR tables generation script.
  */
 #define _Z_ISR_TABLE_ENTRY(func, param, sect) \
-	static Z_DECL_ALIGN(struct _isr_table_entry)                                      \
+	static const Z_DECL_ALIGN(struct _isr_table_entry)                                \
 		__attribute__((section(sect)))                                            \
 		__used _MK_ISR_ELEMENT_NAME(func, __COUNTER__) = {                        \
 			.arg = (const void *)(param),                                     \
@@ -243,7 +243,7 @@ struct z_shared_isr_table_entry z_shared_sw_isr_table[];
  */
 #define _Z_ISR_DIRECT_TABLE_ENTRY(func, sect)                                                      \
 	COND_CODE_1(CONFIG_IRQ_VECTOR_TABLE_JUMP_BY_ADDRESS, (                                     \
-			static Z_DECL_ALIGN(uintptr_t)                                             \
+			static const Z_DECL_ALIGN(uintptr_t)                                       \
 			__attribute__((section(sect)))                                             \
 			__used _MK_IRQ_ELEMENT_NAME(func, __COUNTER__) = ((uintptr_t)(func));      \
 		), (                                                                               \
