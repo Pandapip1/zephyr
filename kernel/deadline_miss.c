@@ -115,10 +115,10 @@ static int signed_ns(uint32_t diff)
 
 void k_deadline_miss_print(const struct k_deadline_miss *miss)
 {
-	printk("deadline %s: %s %p thread %p: released %u, deadline %d, now %u: "
+	printk("deadline %s: %s %p thread %p: released %u, deadline %u, now %u: "
 	       "%u ns past the deadline, %u ns after release\n",
 	       kind_name(miss->kind), (miss->name != NULL) ? miss->name : "-", miss->object,
-	       (void *)miss->thread, miss->release, miss->deadline, miss->now,
+	       (void *)miss->thread, miss->release, (uint32_t)miss->deadline, miss->now,
 	       cycles_to_ns((int32_t)(miss->now - (uint32_t)miss->deadline)),
 	       cycles_to_ns((int32_t)(miss->now - miss->release)));
 	if (miss->kind == K_DEADLINE_MISS_UNSAT) {
