@@ -692,7 +692,8 @@ bool ztest_has_current_param(void);
 	/* data carries the suite fixture from setup(); use             */ \
 	/* ztest_get_current_param() / ZTEST_GET_PARAM() for the value. */ \
 	static void suite##_##fn(void *data); \
-	static STRUCT_SECTION_ITERABLE(ztest_unit_test, z_ztest_unit_test__##suite##__##fn) = { \
+	static const STRUCT_SECTION_ITERABLE(ztest_unit_test, \
+					     z_ztest_unit_test__##suite##__##fn) = { \
 		.test_suite_name = STRINGIFY(suite), \
 		.name = STRINGIFY(fn), \
 		.test = (_##suite##_##fn##_wrapper), \
@@ -727,7 +728,8 @@ bool ztest_has_current_param(void);
 	static void _##suite##_##fn##_wrapper(void *wrapper_data);                                 \
 	static void suite##_##fn(                                                                  \
 		COND_CODE_1(use_fixture, (struct suite##_fixture *fixture), (void)));              \
-	static STRUCT_SECTION_ITERABLE(ztest_unit_test, z_ztest_unit_test__##suite##__##fn) = {    \
+	static const STRUCT_SECTION_ITERABLE(ztest_unit_test,                                      \
+					     z_ztest_unit_test__##suite##__##fn) = {               \
 		.test_suite_name = STRINGIFY(suite),                                               \
 		.name = STRINGIFY(fn),                                                             \
 		.test = (_##suite##_##fn##_wrapper),                                               \
@@ -858,7 +860,7 @@ struct ztest_test_rule {
  * @param after_each_fn The callback function (ztest_rule_cb) to call after each test (may be NULL)
  */
 #define ZTEST_RULE(name, before_each_fn, after_each_fn)                                            \
-	static STRUCT_SECTION_ITERABLE(ztest_test_rule, z_ztest_test_rule_##name) = {              \
+	static const STRUCT_SECTION_ITERABLE(ztest_test_rule, z_ztest_test_rule_##name) = {        \
 		.before_each = (before_each_fn),                                                   \
 		.after_each = (after_each_fn),                                                     \
 	}
