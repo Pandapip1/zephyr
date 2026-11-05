@@ -219,7 +219,8 @@ static int pcf857x_pin_configure(const struct device *dev, gpio_pin_t pin, gpio_
 		return -ENOTSUP;
 	}
 	if (flags & GPIO_INPUT) {
-		temp_outputs &= ~BIT(pin);
+		drv_data->pins_cfg.configured_as_outputs &= ~BIT(pin);
+		temp_outputs = drv_data->pins_cfg.configured_as_outputs;
 		temp_pins |= (1 << pin);
 	} else if (flags & GPIO_OUTPUT) {
 		drv_data->pins_cfg.configured_as_outputs |= BIT(pin);
@@ -232,7 +233,8 @@ static int pcf857x_pin_configure(const struct device *dev, gpio_pin_t pin, gpio_
 		temp_pins &= ~(1 << pin);
 	}
 
-	ret = pcf857x_port_set_raw(dev, drv_data->pins_cfg.configured_as_outputs, temp_pins, 0);
+	ret = pcf857x_port_set_raw(dev, drv_data->pins_cfg.configured_as_outputs,
+				   temp_pins & drv_data->pins_cfg.configured_as_outputs, 0);
 
 	if (ret == 0) {
 		k_sem_take(&drv_data->lock, K_FOREVER);
