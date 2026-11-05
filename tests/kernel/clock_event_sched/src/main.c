@@ -481,4 +481,65 @@ ZTEST(clock_event_sched, test_plan_inside_lead_rides_an_armed_expiry)
 	zassert_equal(plan.deliver_by, target + ACTIVE_CYCLE_LOGICAL, "HF granularity");
 }
 
+/*
+ * Clients arm 32-bit deadlines against 64-bit logical time. Around logical 2^31 and 2^32 (and
+ * their sums) a deadline's low 32 bits change sign or wrap: arms on either provider must still
+ * be delivered on time, and a late one reported once with its 32-bit deadline.
+ */
+static void deliver_across(uint64_t boundary)
+{
+	struct fake_slot *d = &deep.slots[0];
+	struct fake_slot *a = &active.slots[0];
+	/* Ahead of the boundary by more than the deep provider's lead and the wake budget. */
+	uint64_t ahead = 200U * (LOGICAL_HZ / DEEP_HZ);
+	uint64_t deadline;
+
+	fake_ns = MAX(fake_ns, logical_ns(boundary - ahead));
+	zassert_true(k_clock_event_sched_now() < boundary);
+
+	/* Short lead, crossing the boundary: the active provider. */
+	deadline = boundary + 20U * LOGICAL_HZ / USEC_PER_SEC;
+	fake_ns = MAX(fake_ns, logical_ns(boundary - 20U * LOGICAL_HZ / USEC_PER_SEC));
+	zassert_ok(k_clock_event_arm_abs(&event, (uint32_t)deadline));
+	zassert_true(a->armed);
+	fake_expire(a);
+	zassert_equal(publications, 1U);
+	zassert_true(published_at >= deadline, "never delivered early");
+	zassert_true(logical_ns(published_at - deadline) < 2U * NSEC_PER_USEC);
+
+	/* Long lead, just past the boundary: deep, then active. */
+	deadline = k_clock_event_sched_now() + 100U * (LOGICAL_HZ / DEEP_HZ);
+	zassert_ok(k_clock_event_arm_abs(&event, (uint32_t)deadline));
+	zassert_true(d->armed);
+	fake_expire(d);
+	zassert_equal(publications, 1U, "the wake budget is not the deadline");
+	zassert_true(a->armed);
+	fake_expire(a);
+	zassert_equal(publications, 2U);
+	zassert_true(published_at >= deadline, "never delivered early");
+	zassert_true(logical_ns(published_at - deadline) < 2U * NSEC_PER_USEC);
+	zassert_equal(misses, 0U, "an on-time delivery was reported");
+
+	/* Late, 2^31 cycles on (the next wrap or sign change): reported once, 32-bit deadline. */
+	deadline = boundary + BIT64(31) - 10U * LOGICAL_HZ / USEC_PER_SEC;
+	fake_ns = MAX(fake_ns, logical_ns(deadline - 50U * LOGICAL_HZ / USEC_PER_SEC));
+	zassert_ok(k_clock_event_arm_abs(&event, (uint32_t)deadline));
+	fake_ns = logical_ns(deadline) + 2U * CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS;
+	zassert_true(k_clock_event_sched_now() > boundary + BIT64(31));
+	fake_expire(a);
+	zassert_equal(publications, 3U);
+	zassert_equal(misses, 1U, "a late delivery was not reported once");
+	zassert_equal((uint32_t)last_miss.deadline, (uint32_t)deadline);
+	zassert_true(logical_ns((uint32_t)(last_miss.now - (uint32_t)deadline)) >
+		     CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS);
+}
+
+ZTEST(clock_event_sched, test_wrap_deliveries_across_2_31_and_2_32)
+{
+	deliver_across(BIT64(31));
+	publications = 0U;
+	misses = 0U;
+	deliver_across(BIT64(32) + BIT64(31));
+}
+
 ZTEST_SUITE(clock_event_sched, NULL, setup, before, NULL, NULL);
