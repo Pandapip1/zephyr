@@ -470,6 +470,12 @@ toolchain_ld_force_undefined_symbols(
 if(NOT CONFIG_NATIVE_BUILD)
   zephyr_link_libraries(PROPERTY baremetal)
 
+  # Code placed in RAM (.ramfunc) shares a load segment with the data that
+  # follows it. The Zephyr SDK's binutils is configured with
+  # --disable-warn-rwx-segments; turn the warning off for other GNU ld
+  # builds (2.39 and later) too, so warnings_as_errors does not fail them.
+  zephyr_link_libraries(PROPERTY no_warn_rwx_segments)
+
   # Note that some architectures will skip this flag if set to error, even
   # though the compiler flag check passes (e.g. ARC and Xtensa). So warning
   # should be the default for now.
