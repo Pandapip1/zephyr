@@ -22,6 +22,8 @@ config I2C_SILABS_TIMEOUT
 	int "I2C operation timeout (milliseconds)"
 	default 1000
 	help
-		Specify the timeout value in milliseconds for I2C transfer.
+		Specify the timeout value in milliseconds for I2C transfer. A leader
+		transfer without DMA is aborted when it has not completed within it,
+		for example with SDA held low.
 
 endif # I2C_SILABS

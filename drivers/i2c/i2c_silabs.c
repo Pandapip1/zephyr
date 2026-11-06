@@ -16,6 +16,7 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/pm/policy.h>
+#include <sl_hal_i2c.h>
 #include <sl_i2c.h>
 #include <sli_i2c.h>
 
@@ -41,6 +42,17 @@ struct i2c_silabs_dev_config {
 	uint32_t concat_buf_size;                               /* Size of concatenation buffer */
 };
 
+/* Bus phase of a leader transfer without DMA, one per awaited event */
+enum i2c_silabs_leader_state {
+	I2C_SILABS_LEADER_IDLE,
+	I2C_SILABS_LEADER_ADDR,       /* (first) address byte on the bus */
+	I2C_SILABS_LEADER_ADDR_10BIT, /* second byte of a 10-bit address on the bus */
+	I2C_SILABS_LEADER_TX,         /* data byte on the bus */
+	I2C_SILABS_LEADER_READ_ADDR,  /* read address after a (repeated) START */
+	I2C_SILABS_LEADER_RX,         /* receiving */
+	I2C_SILABS_LEADER_STOP,       /* STOP requested */
+};
+
 /* Structure for I2C device data */
 struct i2c_silabs_dev_data {
 	struct k_sem bus_lock;               /* Semaphore to lock the I2C bus */
@@ -58,6 +70,16 @@ struct i2c_silabs_dev_data {
 	bool callback_invoked;   /* Tracks if callback has been invoked */
 #endif
 	bool pm_lock_done; /* Tracks if PM lock release has occurred */
+	/* Leader transfer without DMA, advanced by the I2C interrupt */
+	const uint8_t *tx_buf;
+	uint8_t *rx_buf;
+	uint32_t tx_len;
+	uint32_t rx_len;
+	uint32_t tx_pos;
+	uint32_t rx_pos;
+	uint8_t addr_byte[2];
+	enum i2c_silabs_leader_state leader_state;
+	int leader_result;
 };
 
 static bool i2c_silabs_is_dma_enabled_instance(const struct device *dev)
@@ -216,6 +238,159 @@ static void i2c_silabs_scatter_message(const struct device *dev, struct i2c_msg 
 	}
 }
 
+/* Bus events a leader transfer advances on (EFR32xG22 RM, I2C leader mode) */
+#define I2C_SILABS_LEADER_IEN                                                                      \
+	(I2C_IEN_ACK | I2C_IEN_NACK | I2C_IEN_RXDATAV | I2C_IEN_MSTOP | SL_HAL_I2C_IEN_ERRORS)
+/* R/W bit of an address byte */
+#define I2C_SILABS_ADDR_READ 0x01U
+/* First byte of a 10-bit address: 11110 followed by address bits 9:8 (I2C-bus spec 3.1.11) */
+#define I2C_SILABS_10BIT_FIRST(addr) (0xF0U | (((addr) >> 7) & 0x06U))
+
+static I2C_TypeDef *i2c_silabs_regs(const struct device *dev)
+{
+	const struct i2c_silabs_dev_config *config = dev->config;
+
+	return sl_device_peripheral_i2c_get_base_addr(config->peripheral);
+}
+
+static void i2c_silabs_leader_finish(const struct device *dev, int result)
+{
+	struct i2c_silabs_dev_data *data = dev->data;
+
+	i2c_silabs_regs(dev)->IEN_CLR = I2C_SILABS_LEADER_IEN;
+	if (data->leader_result == 0) {
+		data->leader_result = result;
+	}
+	data->leader_state = I2C_SILABS_LEADER_IDLE;
+	k_sem_give(&data->transfer_sem);
+}
+
+static void i2c_silabs_leader_stop(I2C_TypeDef *i2c, struct i2c_silabs_dev_data *data, int result)
+{
+	if (data->leader_result == 0) {
+		data->leader_result = result;
+	}
+	data->leader_state = I2C_SILABS_LEADER_STOP;
+	i2c->CMD = I2C_CMD_STOP;
+}
+
+/* The next byte to write, else the read address after a repeated START, else STOP */
+static void i2c_silabs_leader_send_next(I2C_TypeDef *i2c, struct i2c_silabs_dev_data *data)
+{
+	if (data->tx_pos < data->tx_len) {
+		data->leader_state = I2C_SILABS_LEADER_TX;
+		i2c->TXDATA = data->tx_buf[data->tx_pos++];
+	} else if (data->rx_len > 0U) {
+		data->leader_state = I2C_SILABS_LEADER_READ_ADDR;
+		i2c->CMD = I2C_CMD_START;
+		i2c->TXDATA = data->addr_byte[0] | I2C_SILABS_ADDR_READ;
+	} else {
+		i2c_silabs_leader_stop(i2c, data, 0);
+	}
+}
+
+static void i2c_silabs_leader_isr(const struct device *dev)
+{
+	struct i2c_silabs_dev_data *data = dev->data;
+	I2C_TypeDef *i2c = i2c_silabs_regs(dev);
+	uint32_t pending = i2c->IF & i2c->IEN;
+
+	i2c->IF_CLR = pending;
+	if ((pending & SL_HAL_I2C_IF_ERRORS) != 0U) {
+		i2c->CMD = I2C_CMD_ABORT;
+		i2c_silabs_leader_finish(dev, -EIO);
+		return;
+	}
+	if ((pending & I2C_IF_NACK) != 0U) {
+		i2c_silabs_leader_stop(i2c, data, -EIO);
+	} else if ((pending & I2C_IF_ACK) != 0U) {
+		switch (data->leader_state) {
+		case I2C_SILABS_LEADER_ADDR:
+			if (data->is_10bit_addr) {
+				data->leader_state = I2C_SILABS_LEADER_ADDR_10BIT;
+				i2c->TXDATA = data->addr_byte[1];
+			} else {
+				i2c_silabs_leader_send_next(i2c, data);
+			}
+			break;
+		case I2C_SILABS_LEADER_ADDR_10BIT:
+		case I2C_SILABS_LEADER_TX:
+			i2c_silabs_leader_send_next(i2c, data);
+			break;
+		case I2C_SILABS_LEADER_READ_ADDR:
+			data->leader_state = I2C_SILABS_LEADER_RX;
+			break;
+		default:
+			break;
+		}
+	}
+	if ((pending & I2C_IF_RXDATAV) != 0U && data->leader_state == I2C_SILABS_LEADER_RX) {
+		data->rx_buf[data->rx_pos++] = i2c->RXDATA;
+		if (data->rx_pos < data->rx_len) {
+			i2c->CMD = I2C_CMD_ACK;
+		} else {
+			i2c->CMD = I2C_CMD_NACK;
+			i2c_silabs_leader_stop(i2c, data, 0);
+		}
+	}
+	if ((pending & I2C_IF_MSTOP) != 0U) {
+		i2c_silabs_leader_finish(dev, 0);
+	}
+}
+
+/*
+ * Leader transfer without DMA: write @p tx, then read @p rx after a repeated START. The I2C
+ * interrupt moves it on one bus event at a time, so interrupts stay enabled for its length, and
+ * the wait is bounded by CONFIG_I2C_SILABS_TIMEOUT whatever the bus does.
+ */
+static int i2c_silabs_leader_transfer(const struct device *dev, uint16_t addr, const uint8_t *tx,
+				      uint32_t tx_len, uint8_t *rx, uint32_t rx_len)
+{
+	struct i2c_silabs_dev_data *data = dev->data;
+	I2C_TypeDef *i2c = i2c_silabs_regs(dev);
+	unsigned int key;
+
+	data->tx_buf = tx;
+	data->tx_len = tx_len;
+	data->tx_pos = 0U;
+	data->rx_buf = rx;
+	data->rx_len = rx_len;
+	data->rx_pos = 0U;
+	data->leader_result = 0;
+	if (data->is_10bit_addr) {
+		data->addr_byte[0] = I2C_SILABS_10BIT_FIRST(addr);
+		data->addr_byte[1] = (uint8_t)addr;
+	} else {
+		data->addr_byte[0] = (uint8_t)(addr << 1);
+	}
+	k_sem_reset(&data->transfer_sem);
+
+	if (!data->is_10bit_addr && tx_len == 0U && rx_len > 0U) {
+		data->leader_state = I2C_SILABS_LEADER_READ_ADDR;
+	} else {
+		data->leader_state = I2C_SILABS_LEADER_ADDR;
+	}
+	sl_hal_i2c_flush_buffers(i2c);
+	i2c->IF_CLR = _I2C_IF_MASK;
+	i2c->IEN_SET = I2C_SILABS_LEADER_IEN;
+	i2c->TXDATA = data->addr_byte[0] |
+		      ((data->leader_state == I2C_SILABS_LEADER_READ_ADDR) ? I2C_SILABS_ADDR_READ
+									    : 0U);
+	i2c->CMD = I2C_CMD_START;
+
+	if (k_sem_take(&data->transfer_sem, K_MSEC(CONFIG_I2C_SILABS_TIMEOUT)) != 0) {
+		key = irq_lock();
+		i2c->IEN_CLR = I2C_SILABS_LEADER_IEN;
+		i2c->CMD = I2C_CMD_ABORT;
+		i2c->IF_CLR = _I2C_IF_MASK;
+		data->leader_state = I2C_SILABS_LEADER_IDLE;
+		irq_unlock(key);
+		return -ETIMEDOUT;
+	}
+
+	return data->leader_result;
+}
+
 /* Function to handle DMA transfer */
 static int i2c_silabs_transfer_dma(const struct device *dev, struct i2c_msg *msgs, uint8_t num_msgs,
 				   uint16_t addr, i2c_callback_t cb, void *userdata,
@@ -358,10 +533,9 @@ static int i2c_silabs_transfer_sync(const struct device *dev, struct i2c_msg *ms
 				goto out;
 			}
 
-			if (sl_i2c_leader_transfer_blocking(&data->i2c_handle, addr, tx_buf,
-							    tx_buf_len, buf, buf_len,
-							    CONFIG_I2C_SILABS_TIMEOUT) != 0) {
-				err = -EIO;
+			err = i2c_silabs_leader_transfer(dev, addr, tx_buf, tx_buf_len, buf,
+							 buf_len);
+			if (err != 0) {
 				goto out;
 			}
 		} else if (msgs[i].flags & I2C_MSG_READ) {
@@ -373,10 +547,8 @@ static int i2c_silabs_transfer_sync(const struct device *dev, struct i2c_msg *ms
 					goto out;
 				}
 			} else {
-				if (sl_i2c_leader_receive_blocking(
-					    &data->i2c_handle, addr, buf, buf_len,
-					    CONFIG_I2C_SILABS_TIMEOUT) != 0) {
-					err = -ETIMEDOUT;
+				err = i2c_silabs_leader_transfer(dev, addr, NULL, 0U, buf, buf_len);
+				if (err != 0) {
 					goto out;
 				}
 			}
@@ -388,10 +560,8 @@ static int i2c_silabs_transfer_sync(const struct device *dev, struct i2c_msg *ms
 					goto out;
 				}
 			} else {
-				if (sl_i2c_leader_send_blocking(&data->i2c_handle, addr, buf,
-								buf_len,
-								CONFIG_I2C_SILABS_TIMEOUT) != 0) {
-					err = -ETIMEDOUT;
+				err = i2c_silabs_leader_transfer(dev, addr, buf, buf_len, NULL, 0U);
+				if (err != 0) {
 					goto out;
 				}
 			}
@@ -596,6 +766,12 @@ void i2c_silabs_isr_handler(const struct device *dev)
 	struct i2c_silabs_dev_data *data = dev->data;
 	sl_i2c_handle_t *sl_i2c_handle = &data->i2c_handle;
 
+	if (!IS_ENABLED(CONFIG_I2C_SILABS_DMA) || !i2c_silabs_is_dma_enabled_instance(dev)) {
+		if (!IS_ENABLED(CONFIG_I2C_TARGET)) {
+			i2c_silabs_leader_isr(dev);
+		}
+		return;
+	}
 	if (IS_ENABLED(CONFIG_I2C_TARGET)) {
 		sli_i2c_follower_dispatch_interrupt(sl_i2c_handle);
 	} else {
@@ -645,11 +821,9 @@ static DEVICE_API(i2c, i2c_silabs_dev_driver_api) = {
                                                                                                    \
 	static void i2c_silabs_irq_config_##idx(void)                                              \
 	{                                                                                          \
-		COND_CODE_1(CONFIG_I2C_SILABS_DMA,                                                 \
-			    (IRQ_CONNECT(DT_INST_IRQ(idx, irq), DT_INST_IRQ(idx, priority),        \
-					 i2c_silabs_isr_handler, DEVICE_DT_INST_GET(idx), 0);      \
-			     irq_enable(DT_INST_IRQ(idx, irq));),                                  \
-			    ())									   \
+		IRQ_CONNECT(DT_INST_IRQ(idx, irq), DT_INST_IRQ(idx, priority),                     \
+			    i2c_silabs_isr_handler, DEVICE_DT_INST_GET(idx), 0);                   \
+		irq_enable(DT_INST_IRQ(idx, irq));                                                 \
 	}                                                                                          \
 	                                                                                           \
 	static const uint32_t i2c_bus_clock_##idx = DT_INST_CLOCKS_CELL(idx, enable);              \
