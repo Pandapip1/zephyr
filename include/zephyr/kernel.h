@@ -1293,10 +1293,10 @@ void k_deadline_event_budget_set(struct k_deadline_event *event, uint32_t budget
  *
  * Checks that a release at @p release can start by @p deadline given all
  * admitted work, then keeps it as admitted future demand until it is
- * posted or cancelled. Infeasibility, for this release or for work admitted
- * earlier that it would push past its deadline, is reported to the
- * missed-deadline policy as K_DEADLINE_MISS_UNSAT for the job priority
- * sacrifices.
+ * posted or cancelled. A release that could not start by its deadline, or
+ * would push work admitted earlier past its own, is refused: reported to the
+ * missed-deadline policy as K_DEADLINE_MISS_UNSAT for @p event. Admitted work
+ * is reported instead only when it is infeasible without this release.
  *
  * @isr_ok
  *
@@ -1326,8 +1326,10 @@ void k_deadline_event_admit_cancel(struct k_deadline_event *event);
  *        all admitted work feasible.
  *
  * For work outside any deadline event that the caller is about to do, such as
- * a bounded busy-wait at its own priority. Infeasibility is reported as
- * K_DEADLINE_MISS_UNSAT for the job priority sacrifices.
+ * a bounded busy-wait at its own priority. Work that would push admitted work
+ * past its deadline is refused: reported as K_DEADLINE_MISS_UNSAT with no
+ * object. Admitted work is reported instead only when it is infeasible
+ * without this demand.
  *
  * @isr_ok
  *

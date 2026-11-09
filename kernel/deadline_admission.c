@@ -28,10 +28,12 @@
  * check: a lower-priority section with interrupts or the scheduler locked,
  * and interrupt handling.
  *
- * When some job would start late, the job reported is the one the policy
- * sacrifices: the lowest priority among the late ones, and of those the
- * latest deadline. A high-priority job is never declared infeasible to make
- * room for a lower one.
+ * An admitted job keeps its guarantee. When a release or an admission would
+ * make some job start late, the request fails and is reported: a request is
+ * never admitted by revoking work admitted before it, whatever the
+ * priorities. Only when the admitted set is infeasible without the request
+ * too is admitted work reported: the lowest priority among the late jobs,
+ * and of those the latest deadline.
  */
 
 #include <zephyr/kernel.h>
@@ -177,8 +179,13 @@ static bool sim_run(struct sim *s)
 	return ok;
 }
 
-/* Fill @p s with the admitted job set at @p now. Caller holds the scheduler lock. */
-static void sim_collect(struct sim *s, uint32_t now)
+/*
+ * Fill @p s with the admitted job set at @p now. Without the run @p exclude's
+ * publications have not started (its pending run, or the run latched behind
+ * its run in progress) when @p exclude is not NULL. Caller holds the scheduler
+ * lock.
+ */
+static void sim_collect(struct sim *s, uint32_t now, const struct k_deadline_event *exclude)
 {
 	struct k_deadline_event *event;
 
@@ -214,7 +221,7 @@ static void sim_collect(struct sim *s, uint32_t now)
 			}
 			j->deadline = rel((uint32_t)consumer->base.prio_deadline, now);
 			j->work = event->run_budget;
-			if (event->pending) {
+			if (event->pending && event != exclude) {
 				/* A run latched behind this one. */
 				struct sim_job *next = sim_add(s);
 
@@ -230,7 +237,7 @@ static void sim_collect(struct sim *s, uint32_t now)
 					};
 				}
 			}
-		} else if (event->admission_state == ADMIT_PENDING) {
+		} else if (event->admission_state == ADMIT_PENDING && event != exclude) {
 			j = sim_add(s);
 			if (j == NULL) {
 				break;
@@ -303,9 +310,15 @@ static uint32_t sim_demand(const struct sim *s, const struct sim_job *victim)
 }
 
 /*
- * Run the check over the current job set plus @p extra. @p requester is the
- * event whose release or admission asks for the check, NULL for bare demand.
- * Caller holds the scheduler lock.
+ * Run the check over the current job set plus the request: @p extra, or the
+ * publication of @p requester just recorded when @p extra is NULL. @p requester
+ * is the event whose release or admission asks for the check, NULL for bare
+ * demand. Caller holds the scheduler lock.
+ *
+ * An admitted job keeps its guarantee: when the request would make work late,
+ * the request is what fails, reported with the deadline and the demand of the
+ * job it would make late. Only when the set is infeasible without the request
+ * too (admitted work already cannot be met) is that work reported.
  */
 static bool admission_check(uint32_t now, const struct sim_job *extra,
 			    struct k_deadline_event *requester,
@@ -315,7 +328,7 @@ static bool admission_check(uint32_t now, const struct sim_job *extra,
 	static struct sim s;
 	const struct sim_job *victim;
 
-	sim_collect(&s, now);
+	sim_collect(&s, now, NULL);
 	if (extra != NULL) {
 		struct sim_job *j = sim_add(&s);
 
@@ -338,6 +351,20 @@ static bool admission_check(uint32_t now, const struct sim_job *extra,
 	victim = sim_victim(&s);
 	verdict->victim = victim->event;
 	verdict->now = now;
+	verdict->release = now + (uint32_t)victim->release;
+	verdict->deadline = (int)(now + (uint32_t)victim->deadline);
+	verdict->demand = sim_demand(&s, victim);
+	if (victim->event == requester && requester != NULL) {
+		return false;
+	}
+	/* Admitted work is late: is it late without the request too? */
+	sim_collect(&s, now, (extra != NULL) ? NULL : requester);
+	if (s.overflow || sim_run(&s)) {
+		verdict->victim = requester;
+		return false;
+	}
+	victim = sim_victim(&s);
+	verdict->victim = victim->event;
 	verdict->release = now + (uint32_t)victim->release;
 	verdict->deadline = (int)(now + (uint32_t)victim->deadline);
 	verdict->demand = sim_demand(&s, victim);

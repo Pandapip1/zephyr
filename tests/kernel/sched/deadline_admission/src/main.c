@@ -243,41 +243,70 @@ ZTEST(deadline_admission, test_feasible_release_is_admitted)
 }
 
 /*
- * Priority decides: a high-priority release whose work leaves no room for an
- * admitted low-priority one is admitted, and the low-priority job, which can
- * no longer start by its deadline, is reported unsat before either runs.
+ * An admitted job keeps its guarantee: a high-priority release whose work
+ * leaves no room for an admitted low-priority one is the release that fails,
+ * reported with the deadline and the demand of the job it would make late.
  */
-ZTEST(deadline_admission, test_higher_priority_release_sacrifices_lower)
+ZTEST(deadline_admission, test_higher_priority_release_cannot_revoke_lower)
 {
 	static const struct release r[] = {{JOB_LOW, 300U}, {JOB_HIGH, 2000U}};
 
 	budget(JOB_LOW, 50U);
 	budget(JOB_HIGH, 500U);
 	release_in_irq(r, ARRAY_SIZE(r));
-	zassert_true(misses >= 1, "infeasibility was not reported at release");
+	zassert_equal(misses, 1, "infeasibility was not reported at release");
 	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
-	zassert_equal_ptr(last_miss.object, &events[JOB_LOW], "the lower priority is sacrificed");
-	zassert_true(last_miss.demand >= US(500U), "the higher job's work is ahead of it");
+	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH], "the request is refused");
+	zassert_true(last_miss.demand >= US(500U), "the request's work is ahead of the late job");
 	sleep_ms(2U);
-	zassert_true((int32_t)(started_at[JOB_HIGH] - last_miss.now) >= 0,
-		     "reported before the admitted job ran");
+	zassert_equal(runs[JOB_HIGH], 0, "a refused release ran");
+	zassert_equal(runs[JOB_LOW], 1, "the admitted job did not run");
+	zassert_equal(misses, 1, "the admitted job started late");
 }
 
 /*
  * Within one priority the earliest deadline goes first: a release due sooner
- * whose work pushes an admitted job of the same priority past its deadline
- * makes that later-deadline job unsat.
+ * whose work would push an admitted job of the same priority past its
+ * deadline fails itself.
  */
-ZTEST(deadline_admission, test_earlier_deadline_sacrifices_later_at_same_priority)
+ZTEST(deadline_admission, test_earlier_deadline_cannot_revoke_later_at_same_priority)
 {
 	static const struct release r[] = {{JOB_HIGH2, 600U}, {JOB_HIGH, 200U}};
 
 	budget(JOB_HIGH2, 100U);
 	budget(JOB_HIGH, 650U);
 	release_in_irq(r, ARRAY_SIZE(r));
-	zassert_true(misses >= 1);
+	zassert_equal(misses, 1);
 	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
-	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH2]);
+	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH]);
+}
+
+/*
+ * Admitted work that is late without the request is what is reported: the
+ * request did not cause it. Here a low-priority release is admitted, then a
+ * same-priority job is made late by a budget raised behind the scheduler's
+ * back (as an overrun would); the next request finds the set infeasible
+ * without itself.
+ */
+ZTEST(deadline_admission, test_infeasible_admitted_work_is_reported_itself)
+{
+	uint32_t now = k_cycle_get_32();
+
+	budget(JOB_LOW, 50U);
+	budget(JOB_HIGH, 50U);
+	zassert_equal(k_deadline_event_admit(&events[JOB_LOW], now + US(100U), now + US(100U),
+					     (int)(now + US(300U))),
+		      0);
+	zassert_equal(k_deadline_event_admit(&events[JOB_HIGH], now + US(50U), now + US(50U),
+					     (int)(now + US(5000U))),
+		      0);
+	/* Its admitted release now brings far more work than was admitted. */
+	k_deadline_event_budget_set(&events[JOB_HIGH], US(1000U));
+	zassert_equal(k_deadline_demand_admit(PRIO_LOW + 1, US(1U)), -ETIME);
+	zassert_equal(misses, 1);
+	zassert_equal_ptr(last_miss.object, &events[JOB_LOW], "the late admitted job");
+	k_deadline_event_admit_cancel(&events[JOB_LOW]);
+	k_deadline_event_admit_cancel(&events[JOB_HIGH]);
 }
 
 /* A release that cannot start by its own deadline is unsat itself. */
@@ -379,9 +408,9 @@ ZTEST(deadline_admission, test_post_at_starts_at_its_instant)
 /*
  * Waiting out an instant is demand at the waiter's priority. A wait at the
  * high priority that would make an admitted low-priority job start late is
- * resolved by priority: the low job is unsat.
+ * refused: the low job keeps its guarantee.
  */
-ZTEST(deadline_admission, test_spin_demand_sacrifices_admitted_lower_job)
+ZTEST(deadline_admission, test_spin_demand_cannot_revoke_admitted_lower_job)
 {
 	uint32_t now = k_cycle_get_32();
 
@@ -391,7 +420,7 @@ ZTEST(deadline_admission, test_spin_demand_sacrifices_admitted_lower_job)
 	zassert_equal(misses, 0);
 	zassert_equal(k_deadline_demand_admit(PRIO_HIGH, US(500U)), -ETIME);
 	zassert_equal(misses, 1);
-	zassert_equal_ptr(last_miss.object, &events[JOB_LOW]);
+	zassert_is_null(last_miss.object, "the demand is refused, not the admitted job");
 	k_deadline_event_admit_cancel(&events[JOB_LOW]);
 }
 
@@ -503,7 +532,7 @@ ZTEST(deadline_admission, test_ladder_spin_only)
 
 /*
  * A publication carries its own budget (k_deadline_event_post_budget()): the same event,
- * registered with a short budget, makes an admitted same-priority job unsat only when its
+ * registered with a short budget, fails against an admitted same-priority job only when its
  * publication declares the long one.
  */
 static uint32_t budget_post_us;
@@ -530,7 +559,7 @@ ZTEST(deadline_admission, test_publication_budget)
 	irq_offload(post_with_budget, NULL);
 	zassert_true(misses >= 1, "the long publication's demand was not counted");
 	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
-	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH2]);
+	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH]);
 }
 
 /*
@@ -734,8 +763,8 @@ static void post_latch(const void *param)
 
 /*
  * A publication latched while its consumer runs adds a run behind it. That
- * work is checked: here it pushes an admitted lower-priority release past its
- * deadline, which is reported when the publication is made.
+ * work is checked: here it would push an admitted lower-priority release past
+ * its deadline, so the publication fails when it is made.
  */
 ZTEST(deadline_admission, test_latched_publication_is_checked)
 {
@@ -754,7 +783,7 @@ ZTEST(deadline_admission, test_latched_publication_is_checked)
 	zassert_equal(latch_admitted, 0, "the low release was feasible before the latched work");
 	zassert_equal(latch_misses, 1, "the latched publication was not checked");
 	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
-	zassert_equal_ptr(last_miss.object, &events[JOB_LOW]);
+	zassert_equal_ptr(last_miss.object, &latch_event, "the latched publication fails");
 	k_deadline_event_admit_cancel(&events[JOB_LOW]);
 	k_deadline_event_budget_set(&latch_event, 0U);
 	k_thread_abort(&latch_thread);

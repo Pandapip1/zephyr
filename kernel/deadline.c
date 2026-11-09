@@ -50,7 +50,10 @@ static void deadline_event_post(struct k_deadline_event *event, bool has_not_bef
 	struct k_thread *thread = event->consumer;
 	bool idle = (thread != NULL) && z_is_thread_suspended(thread) &&
 		    ((thread->base.thread_state & ~_THREAD_SUSPENDED) == 0U);
+	/* The event as it was, restored if admission refuses this publication. */
+	struct k_deadline_event before = *event;
 	bool feasible;
+	bool refused;
 
 	/*
 	 * Never count publications, but keep the earliest deadline among those
@@ -90,15 +93,23 @@ static void deadline_event_post(struct k_deadline_event *event, bool has_not_bef
 	ARG_UNUSED(budget);
 #endif
 	event->pending = true;
-	if (idle) {
+	feasible = z_deadline_admission_posted(event, idle, now, &verdict);
+	/*
+	 * A publication admission refuses is not recorded: it neither releases
+	 * the consumer nor joins a pending run, so admitted work keeps its
+	 * guarantee. Admitted work found infeasible without it does not stop it.
+	 */
+	refused = !feasible && (verdict.victim == event);
+	if (refused) {
+		*event = before;
+	} else if (idle) {
 		/* Assign the EDF key before making the consumer observable as ready. */
 		thread->base.prio_deadline = event->deadline;
 		z_mark_thread_as_not_suspended(thread);
 		z_sched_ready_locked(thread);
 	}
-	feasible = z_deadline_admission_posted(event, idle, now, &verdict);
 	if (!feasible) {
-		/* Report before the released consumer can run. */
+		/* Report before a released consumer can run. */
 		z_sched_spinlock_unlock(key);
 		z_deadline_admission_report(&verdict);
 		z_reschedule_unlocked();
