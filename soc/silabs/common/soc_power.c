@@ -44,9 +44,12 @@ void pm_state_set(enum pm_state state, uint8_t substate_id)
 		break;
 	case PM_STATE_SUSPEND_TO_IDLE:
 		EMU_EnterEM2(true);
+		/* EMU_EnterEM2() leaves SLEEPDEEP set: a later k_cpu_idle() would enter EM2 */
+		SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
 		break;
 	case PM_STATE_STANDBY:
 		EMU_EnterEM3(true);
+		SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
 		break;
 	case PM_STATE_SOFT_OFF:
 		EMU_EnterEM4();
