@@ -199,7 +199,9 @@ bool pm_system_suspend(int32_t kernel_ticks)
 #endif /* CONFIG_PM_CUSTOM_TICKS_HOOK */
 
 	key = k_spin_lock(&pm_forced_state_lock);
-	if (z_cpus_pm_forced_state[id] != NULL) {
+	bool forced = z_cpus_pm_forced_state[id] != NULL;
+
+	if (forced) {
 		z_cpus_pm_state[id] = z_cpus_pm_forced_state[id];
 		z_cpus_pm_forced_state[id] = NULL;
 	} else {
@@ -244,6 +246,35 @@ bool pm_system_suspend(int32_t kernel_ticks)
 	key = sys_clock_lock();
 	sys_clock_idle_enter(idle_ticks);
 	sys_clock_unlock(key);
+
+	/*
+	 * Programming the wakeup can lock the state chosen above: a clock-event
+	 * service whose deep-sleep clock cannot serve the deadline keeps its
+	 * active clock running, which a deeper state would stop. Fall back to a
+	 * state still available; the wakeup already allows for the deeper
+	 * state's exit latency.
+	 */
+	if (!forced && !pm_policy_state_is_available(z_cpus_pm_state[id]->state,
+						     z_cpus_pm_state[id]->substate_id)) {
+		const struct pm_state_info *next = pm_policy_next_state(id, ticks);
+
+#ifdef CONFIG_PM_DEVICE_SYSTEM_MANAGED
+		if ((z_cpus_pm_state[id]->state != PM_STATE_RUNTIME_IDLE) &&
+		    !z_cpus_pm_state[id]->pm_device_disabled &&
+		    ((next == NULL) || (next->state == PM_STATE_RUNTIME_IDLE) ||
+		     next->pm_device_disabled)) {
+			pm_resume_devices();
+		}
+		if (next == NULL) {
+			(void)atomic_add(&_cpus_active, 1);
+		}
+#endif
+		z_cpus_pm_state[id] = next;
+		if (next == NULL) {
+			SYS_PORT_TRACING_FUNC_EXIT(pm, system_suspend, ticks, PM_STATE_ACTIVE);
+			return false;
+		}
+	}
 
 	/*
 	 * This function runs with interrupts locked. If a power state is
