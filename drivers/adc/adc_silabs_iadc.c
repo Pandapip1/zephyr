@@ -14,6 +14,7 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/pm/device.h>
+#include <zephyr/pm/policy.h>
 
 #include <sl_hal_iadc.h>
 
@@ -247,6 +248,20 @@ static void iadc_dma_stop(const struct device *dev)
 
 #endif /* CONFIG_ADC_SILABS_IADC_DMA */
 
+/* The converter is clocked from EM01GRPACLK, which stops in EM2 and EM3: no deep sleep while a
+ * sampling is in progress.
+ */
+static void iadc_pm_policy_state_lock(bool lock)
+{
+	if (lock) {
+		pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+		pm_policy_state_lock_get(PM_STATE_STANDBY, PM_ALL_SUBSTATES);
+	} else {
+		pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+		pm_policy_state_lock_put(PM_STATE_STANDBY, PM_ALL_SUBSTATES);
+	}
+}
+
 /* The interrupt handler and the DMA callback can both end a sampling. Whoever gets here first
  * stops the conversion and completes the sampling, the other one finds nothing left to do.
  * A second completion would leave the context's semaphore signaled and let later reads
@@ -260,6 +275,7 @@ static bool iadc_sampling_end(const struct device *dev)
 	if (!atomic_cas(&data->sampling, 1, 0)) {
 		return false;
 	}
+	iadc_pm_policy_state_lock(false);
 
 	sl_hal_iadc_disable_interrupts(config->base, IADC_IEN_SCANTABLEDONE | IADC_ERROR_FLAGS);
 	sl_hal_iadc_stop_scan(config->base);
@@ -610,6 +626,7 @@ static void iadc_start_scan(const struct device *dev)
 	IADC_TypeDef *iadc = (IADC_TypeDef *)config->base;
 
 	sl_hal_iadc_clear_interrupts(iadc, IADC_IF_SCANTABLEDONE | IADC_ERROR_FLAGS);
+	iadc_pm_policy_state_lock(true);
 	atomic_set(&data->sampling, 1);
 
 #ifdef CONFIG_ADC_SILABS_IADC_DMA
@@ -620,6 +637,7 @@ static void iadc_start_scan(const struct device *dev)
 		ret = iadc_dma_start(dev);
 		if (ret < 0) {
 			atomic_clear(&data->sampling);
+			iadc_pm_policy_state_lock(false);
 			iadc_sampling_failed(data, ret);
 			return;
 		}
