@@ -935,4 +935,27 @@ ZTEST(deadline_admission, test_activation_outside_model_is_overrun)
 	zassert_equal(runs[JOB_HIGH], 1, "the refused activation ran");
 }
 
+/*
+ * Interference is bounded per busy period, not from the check: a release far ahead, after the CPU
+ * has gone idle, waits for one release of the armed job, not for every release between the check
+ * and its own (100 us, not 600 us, against a 150 us window). A window shorter than the one
+ * release is still refused.
+ */
+ZTEST(deadline_admission, test_busy_period_bound_for_a_far_release)
+{
+	uint32_t now;
+
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 100U, 1000U, 900U)));
+	budget(JOB_LOW, 50U);
+	now = k_cycle_get_32();
+	zassert_ok(k_deadline_event_admit(&events[JOB_LOW], now + US(5000U), now + US(5000U),
+					  (int)(now + US(5150U))),
+		   "a far release was charged the interference of the whole wait");
+	k_deadline_event_admit_cancel(&events[JOB_LOW]);
+	zassert_equal(k_deadline_event_admit(&events[JOB_LOW], now + US(5000U), now + US(5000U),
+					     (int)(now + US(5050U))),
+		      -ETIME, "a window shorter than one release of the armed job was admitted");
+	k_deadline_event_admit_cancel(&events[JOB_LOW]);
+}
+
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);

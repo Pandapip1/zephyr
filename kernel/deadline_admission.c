@@ -99,7 +99,38 @@ struct sim {
 	int32_t blocking;
 	/* A job did not fit in @ref jobs: the check cannot prove the set feasible. */
 	bool overflow;
+	/*
+	 * What the simulation ran: segment i ran priority seg_prio[i] over
+	 * [seg_start[i], seg_end[i]) (the blocking term as the highest priority);
+	 * the CPU was idle outside them.
+	 */
+	size_t segs;
+	int32_t seg_start[2U * CONFIG_SCHED_DEADLINE_ADMISSION_JOBS + 3U];
+	int32_t seg_end[2U * CONFIG_SCHED_DEADLINE_ADMISSION_JOBS + 3U];
+	int16_t seg_prio[2U * CONFIG_SCHED_DEADLINE_ADMISSION_JOBS + 3U];
 };
+
+/* Record that @p prio ran over [@p start, @p end), merged with a contiguous run of the same. */
+static void sim_segment(struct sim *s, int32_t start, int32_t end, int prio)
+{
+	if (end <= start) {
+		return;
+	}
+	if (s->segs > 0U && s->seg_end[s->segs - 1U] == start &&
+	    s->seg_prio[s->segs - 1U] == (int16_t)prio) {
+		s->seg_end[s->segs - 1U] = end;
+		return;
+	}
+	if (s->segs == ARRAY_SIZE(s->seg_start)) {
+		/* Cannot happen: a step adds at most one segment. Not proved if it did. */
+		s->overflow = true;
+		return;
+	}
+	s->seg_start[s->segs] = start;
+	s->seg_end[s->segs] = end;
+	s->seg_prio[s->segs] = (int16_t)prio;
+	s->segs++;
+}
 
 static int32_t rel(uint32_t t, uint32_t now)
 {
@@ -134,6 +165,9 @@ static bool sim_run(struct sim *s)
 	int32_t t = s->blocking;
 	int current = s->running;
 	bool ok = true;
+
+	s->segs = 0U;
+	sim_segment(s, 0, s->blocking, INT16_MIN);
 
 	/* Each step finishes a job or reaches a release: bounded by twice the jobs. */
 	for (size_t step = 0U; step < 2U * ARRAY_SIZE(s->jobs) + 2U; step++) {
@@ -190,6 +224,7 @@ static bool sim_run(struct sim *s)
 			run = next_release - t;
 		}
 		j->remaining -= (uint32_t)run;
+		sim_segment(s, t, t + run, j->prio);
 		t += run;
 	}
 	return ok;
@@ -310,25 +345,97 @@ static uint64_t sim_released_ahead(const struct sim *s, const struct sim_job *a,
 	return demand;
 }
 
-/* Least fixed point of x = base + demand(x), or a value past @p limit. */
+/*
+ * Least fixed point of w = base + R(w) + W(@p from, @p origin + w), the time
+ * from @p origin by which @p a starts, or a value past @p limit. W is left out
+ * when @p from is negative.
+ */
 #define SIM_FIXED_POINT_STEPS 32U
 
 static int64_t sim_fixed_point(const struct sim *s, const struct sim_job *a, int64_t base,
-			       int64_t from, int64_t limit)
+			       int64_t origin, int64_t from, int64_t limit)
 {
-	int64_t x = base;
+	int64_t w = base;
 
 	for (uint32_t step = 0U; step < SIM_FIXED_POINT_STEPS; step++) {
-		int64_t next = base + (int64_t)sim_recurring(s, a, (uint64_t)MAX(x, 0)) +
-			       ((from >= 0) ? (int64_t)sim_released_ahead(s, a, from, x) : 0);
+		int64_t next = base + (int64_t)sim_recurring(s, a, (uint64_t)MAX(w, 0)) +
+			       ((from >= 0) ? (int64_t)sim_released_ahead(s, a, from, origin + w)
+					    : 0);
 
-		if (next == x || next > limit) {
+		if (next == w || origin + next > limit) {
 			return next;
 		}
-		x = next;
+		w = next;
 	}
 	/* Not settled: not proved. */
-	return limit + 1;
+	return limit + 1 - origin;
+}
+
+/* Work at priority @p prio or above the simulation ran in [@p from, @p to). */
+static int64_t sim_level_work(const struct sim *s, int prio, int32_t from, int32_t to)
+{
+	int64_t work = 0;
+
+	for (size_t i = 0U; i < s->segs; i++) {
+		int32_t a = MAX(s->seg_start[i], from);
+		int32_t b = MIN(s->seg_end[i], to);
+
+		if (s->seg_prio[i] <= prio && b > a) {
+			work += b - a;
+		}
+	}
+	return work;
+}
+
+/* The simulation ran priority @p prio or above just before @p t. */
+static bool sim_level_busy_before(const struct sim *s, int prio, int32_t t)
+{
+	for (size_t i = 0U; i < s->segs; i++) {
+		if (s->seg_prio[i] <= prio && s->seg_start[i] < t && s->seg_end[i] >= t) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Latest start of one-shot job @p j, which the simulation started at s
+ * without interference. The level-p busy period (p its priority) in which it
+ * really starts begins at a time u at which the CPU ran nothing at p or above.
+ * Interference only delays work, so the simulation, which has done at least as
+ * much by any time, was idle at level p there too: u is 0 or the start of one
+ * of the simulation's level-p busy periods at or before s. From such a u, j
+ * starts within the least fixed point of
+ *   w = L(u, s) + B + R(w) + W(s, u + w),
+ * L the level-p work the simulation ran in [u, s): the bound is the largest
+ * u + w over the candidates.
+ */
+static int64_t sim_one_shot_start(const struct sim *s, const struct sim_job *j)
+{
+	int64_t blocker = sim_blocker(s, j);
+	int64_t latest = j->start;
+
+	for (size_t i = 0U; i <= s->segs; i++) {
+		int32_t u;
+		int64_t w;
+
+		if (i == s->segs) {
+			u = 0;
+		} else {
+			u = s->seg_start[i];
+			if (s->seg_prio[i] > j->prio || u > j->start ||
+			    sim_level_busy_before(s, j->prio, u)) {
+				continue;
+			}
+		}
+		w = sim_fixed_point(s, j, sim_level_work(s, j->prio, u, j->start) + blocker, u,
+				    j->start, j->deadline);
+		latest = MAX(latest, (int64_t)u + w);
+		if (latest > j->deadline) {
+			break;
+		}
+	}
+	return latest;
 }
 
 /*
@@ -336,15 +443,14 @@ static int64_t sim_fixed_point(const struct sim *s, const struct sim_job *a, int
  * releases of recurring jobs can come at any time. Check each job against
  * them, conservatively:
  *
- * - A one-shot job the simulation starts at s, interference-free, starts by
- *   the least x with x = s + B + R(x) + W(s, x): R the recurring work of an
- *   interval of length x (sim_recurring(), counted from the check, so it
- *   covers every phase), W the one-shot work released after s that runs ahead
- *   of it, B one blocker the policy will not switch from (sim_blocker()).
- *   Delaying a preemptive schedule by interference delays a start by at most
- *   that interference; within a cooperative priority it can also reorder runs
- *   (a run delayed past a later release lets that release start first and
- *   hold the CPU), which B covers.
+ * - A one-shot job the simulation starts at s, interference-free: per busy
+ *   period, sim_one_shot_start(). R is the recurring work of an interval of
+ *   length w (sim_recurring(): any phase), W the one-shot work released after
+ *   s that runs ahead of it, B one blocker the policy will not switch from
+ *   (sim_blocker()). Delaying a preemptive schedule by interference delays a
+ *   start by at most that interference; within a cooperative priority it can
+ *   also reorder runs (a run delayed past a later release lets that release
+ *   start first and hold the CPU), which B covers.
  * - A recurring job, released at the worst moment, starts by the least x with
  *   x = blocking + B + O + R(x): O all the one-shot work at its priority or
  *   above (each runs once, wherever it falls), R the other reservations.
@@ -379,12 +485,11 @@ static bool sim_bound(struct sim *s)
 					base += o->work;
 				}
 			}
-			x = sim_fixed_point(s, j, base, -1, j->deadline);
+			x = sim_fixed_point(s, j, base, 0, -1, j->deadline);
 		} else if (!j->started) {
 			x = (int64_t)j->deadline + 1;
 		} else {
-			x = sim_fixed_point(s, j, (int64_t)j->start + sim_blocker(s, j), j->start,
-					    j->deadline);
+			x = sim_one_shot_start(s, j);
 		}
 		if (x > j->deadline) {
 			j->late = true;
