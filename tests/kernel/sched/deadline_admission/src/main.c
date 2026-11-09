@@ -635,4 +635,66 @@ ZTEST(deadline_admission, test_failure_during_a_report_reaches_the_policy)
 	k_deadline_event_admit_cancel(&events[JOB_LOW]);
 }
 
+#define FILL_JOBS CONFIG_SCHED_DEADLINE_ADMISSION_JOBS
+
+static struct k_deadline_event fill_events[FILL_JOBS];
+static struct k_thread fill_threads[FILL_JOBS];
+K_THREAD_STACK_ARRAY_DEFINE(fill_stacks, FILL_JOBS, STACK_SIZE);
+static K_SEM_DEFINE(fill_armed, 0, FILL_JOBS);
+
+static void fill_job(void *p1, void *p2, void *p3)
+{
+	struct k_deadline_event *event = p1;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+	k_sem_give(&fill_armed);
+	for (;;) {
+		k_deadline_event_wait(event);
+	}
+}
+
+/*
+ * A check holds at most CONFIG_SCHED_DEADLINE_ADMISSION_JOBS jobs. With the
+ * table full of feasible timed releases, one more cannot be proved and is
+ * refused, although the set would be feasible.
+ */
+ZTEST(deadline_admission, test_full_job_table_is_unsat)
+{
+	uint32_t now;
+
+	for (int i = 0; i < FILL_JOBS; i++) {
+		k_deadline_event_init(&fill_events[i]);
+		(void)k_thread_create(&fill_threads[i], fill_stacks[i], STACK_SIZE, fill_job,
+				      &fill_events[i], NULL, NULL, PRIO_LOW, 0, K_NO_WAIT);
+	}
+	for (int i = 0; i < FILL_JOBS; i++) {
+		k_sem_take(&fill_armed, K_FOREVER);
+	}
+	sleep_ms(1U);
+	budget(JOB_HIGH, 1U);
+	now = k_cycle_get_32();
+	for (int i = 0; i < FILL_JOBS; i++) {
+		k_deadline_event_budget_set(&fill_events[i], US(1U));
+		zassert_equal(k_deadline_event_admit(&fill_events[i], now + US(USEC_PER_SEC),
+						     now + US(USEC_PER_SEC),
+						     (int)(now + US(2U * USEC_PER_SEC))),
+			      0, "a feasible release in a table with room was refused");
+	}
+	zassert_equal(misses, 0);
+	zassert_equal(k_deadline_event_admit(&events[JOB_HIGH], now + US(USEC_PER_SEC),
+					     now + US(USEC_PER_SEC),
+					     (int)(now + US(2U * USEC_PER_SEC))),
+		      -ETIME, "a release beyond the table was admitted unproved");
+	zassert_equal(misses, 1);
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
+	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH], "the request is refused");
+	k_deadline_event_admit_cancel(&events[JOB_HIGH]);
+	for (int i = 0; i < FILL_JOBS; i++) {
+		k_deadline_event_admit_cancel(&fill_events[i]);
+		k_deadline_event_budget_set(&fill_events[i], 0U);
+		k_thread_abort(&fill_threads[i]);
+	}
+}
+
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);

@@ -207,7 +207,8 @@ config SCHED_DEADLINE_ADMISSION_JOBS
 	range 2 64
 	help
 	  Largest number of admitted runs, pending, running or armed, one
-	  check considers. Work beyond it is not counted.
+	  check considers. A check that needs more is infeasible: the
+	  release or admission that asked for it is reported unsat.
 
 config SCHED_DEADLINE_STATS
 	bool "Record the longest run and start latency of each deadline event"

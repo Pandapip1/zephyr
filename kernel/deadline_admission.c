@@ -78,6 +78,8 @@ struct sim {
 	int running;
 	/* CPU unavailable to every job from the start of the check. */
 	int32_t blocking;
+	/* A job did not fit in @ref jobs: the check cannot prove the set feasible. */
+	bool overflow;
 };
 
 static int32_t rel(uint32_t t, uint32_t now)
@@ -88,6 +90,7 @@ static int32_t rel(uint32_t t, uint32_t now)
 static struct sim_job *sim_add(struct sim *s)
 {
 	if (s->count == ARRAY_SIZE(s->jobs)) {
+		s->overflow = true;
 		return NULL;
 	}
 	s->jobs[s->count] = (struct sim_job){0};
@@ -179,6 +182,7 @@ static void sim_collect(struct sim *s, uint32_t now)
 
 	s->count = 0U;
 	s->running = -1;
+	s->overflow = false;
 
 	/* Lower-priority non-preemptible sections and interrupts: ahead of everything. */
 	s->blocking = (int32_t)BLOCKING_CYCLES;
@@ -295,8 +299,13 @@ static uint32_t sim_demand(const struct sim *s, const struct sim_job *victim)
 	return demand;
 }
 
-/* Run the check over the current job set plus @p extra. Caller holds the scheduler lock. */
+/*
+ * Run the check over the current job set plus @p extra. @p requester is the
+ * event whose release or admission asks for the check, NULL for bare demand.
+ * Caller holds the scheduler lock.
+ */
 static bool admission_check(uint32_t now, const struct sim_job *extra,
+			    struct k_deadline_event *requester,
 			    struct admission_verdict *verdict)
 {
 	/* One check at a time: the simulation state is too large for small stacks. */
@@ -310,6 +319,15 @@ static bool admission_check(uint32_t now, const struct sim_job *extra,
 		if (j != NULL) {
 			*j = *extra;
 		}
+	}
+	if (s.overflow) {
+		/* A job set larger than the check cannot be proved: refuse the request. */
+		verdict->victim = requester;
+		verdict->now = now;
+		verdict->release = now;
+		verdict->deadline = (int)now;
+		verdict->demand = 0U;
+		return false;
 	}
 	if (sim_run(&s)) {
 		return true;
@@ -376,7 +394,7 @@ bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint
 	if (!idle || armed) {
 		return true;
 	}
-	return admission_check(now, NULL, verdict);
+	return admission_check(now, NULL, event, verdict);
 }
 
 void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now, uint32_t budget)
@@ -431,7 +449,7 @@ int k_deadline_event_admit(struct k_deadline_event *event, uint32_t release, uin
 					     .prio = event->consumer->base.prio,
 					     .cooperative = event->consumer->base.prio < 0,
 				     },
-				     &verdict);
+				     event, &verdict);
 		/* Admitted or not, it is armed: later checks must see it. */
 		event->future = true;
 	}
@@ -467,7 +485,7 @@ int k_deadline_demand_admit(int prio, uint32_t cycles)
 				     .prio = prio,
 				     .cooperative = true,
 			     },
-			     &verdict);
+			     NULL, &verdict);
 	z_sched_spinlock_unlock(key);
 	if (!ok) {
 		admission_report(&verdict, k_current_get());
