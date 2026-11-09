@@ -69,6 +69,8 @@ struct sim_job {
 	bool started;
 	bool cooperative;
 	bool late;
+	/* Its deadline only orders it: a run latched behind the run in progress. */
+	bool ordering_only;
 };
 
 struct sim {
@@ -157,7 +159,7 @@ static bool sim_run(struct sim *s)
 			j->started = true;
 			/* Dispatched early, it spins at its priority until its not-before. */
 			j->remaining += (uint32_t)(start - t);
-			if (start - j->deadline > 0) {
+			if (start - j->deadline > 0 && !j->ordering_only) {
 				j->late = true;
 				ok = false;
 			}
@@ -224,6 +226,7 @@ static void sim_collect(struct sim *s, uint32_t now)
 						.work = event->pending_budget,
 						.prio = consumer->base.prio,
 						.cooperative = consumer->base.prio < 0,
+						.ordering_only = true,
 					};
 				}
 			}
@@ -385,13 +388,19 @@ bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint
 	/* A timed release admitted when it was armed is now this publication. */
 	bool armed = event->future;
 
+	ARG_UNUSED(idle);
 	event->future = false;
-	if (event->admission_state == ADMIT_RUNNING) {
-		/* Latched for the next run: served by, or queued behind, the run in progress. */
-		return true;
+	/*
+	 * A publication latched while the consumer runs is served by, or queued
+	 * behind, the run in progress; its deadline only orders the next run. Its
+	 * budget is still work the other admitted jobs must fit around, as is a
+	 * larger budget coalesced into a pending run: every publication not
+	 * admitted when it was armed is checked.
+	 */
+	if (event->admission_state != ADMIT_RUNNING) {
+		event->admission_state = ADMIT_PENDING;
 	}
-	event->admission_state = ADMIT_PENDING;
-	if (!idle || armed) {
+	if (armed) {
 		return true;
 	}
 	return admission_check(now, NULL, event, verdict);

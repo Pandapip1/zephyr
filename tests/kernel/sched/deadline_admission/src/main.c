@@ -697,4 +697,67 @@ ZTEST(deadline_admission, test_full_job_table_is_unsat)
 	}
 }
 
+static struct k_deadline_event latch_event;
+static struct k_thread latch_thread;
+static K_THREAD_STACK_DEFINE(latch_stack, STACK_SIZE);
+static K_SEM_DEFINE(latch_armed, 0, 1);
+static volatile int latch_misses;
+static volatile int latch_admitted;
+
+static void latch_job(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+	k_sem_give(&latch_armed);
+	for (;;) {
+		uint32_t now;
+		int before;
+
+		k_deadline_event_wait(&latch_event);
+		now = k_cycle_get_32();
+		latch_admitted = k_deadline_event_admit(&events[JOB_LOW], now + US(100U),
+							now + US(100U), (int)(now + US(300U)));
+		before = misses;
+		/* Latched behind this run, with work that leaves the low job no room. */
+		k_deadline_event_post_budget(&latch_event, (int)(now + US(5000U)), US(1000U));
+		latch_misses = misses - before;
+		k_deadline_event_reset(&latch_event);
+	}
+}
+
+static void post_latch(const void *param)
+{
+	ARG_UNUSED(param);
+	k_deadline_event_post(&latch_event, (int)(k_cycle_get_32() + US(USEC_PER_SEC)));
+}
+
+/*
+ * A publication latched while its consumer runs adds a run behind it. That
+ * work is checked: here it pushes an admitted lower-priority release past its
+ * deadline, which is reported when the publication is made.
+ */
+ZTEST(deadline_admission, test_latched_publication_is_checked)
+{
+	k_deadline_event_init(&latch_event);
+	latch_event.name = "latch";
+	(void)k_thread_create(&latch_thread, latch_stack, STACK_SIZE, latch_job, NULL, NULL, NULL,
+			      PRIO_HIGH, 0, K_NO_WAIT);
+	k_sem_take(&latch_armed, K_FOREVER);
+	sleep_ms(1U);
+	budget(JOB_LOW, 50U);
+	k_deadline_event_budget_set(&latch_event, US(50U));
+	latch_admitted = -1;
+	latch_misses = 0;
+	irq_offload(post_latch, NULL);
+	sleep_ms(2U);
+	zassert_equal(latch_admitted, 0, "the low release was feasible before the latched work");
+	zassert_equal(latch_misses, 1, "the latched publication was not checked");
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
+	zassert_equal_ptr(last_miss.object, &events[JOB_LOW]);
+	k_deadline_event_admit_cancel(&events[JOB_LOW]);
+	k_deadline_event_budget_set(&latch_event, 0U);
+	k_thread_abort(&latch_thread);
+}
+
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);
