@@ -55,6 +55,8 @@ static void deadline_event_post(struct k_deadline_event *event, bool has_not_bef
 	bool feasible;
 	bool refused;
 
+	/* An armed event's release takes its reservation's deadline and budget. */
+	z_deadline_admission_publication(event, now, &deadline, &budget);
 	/*
 	 * Never count publications, but keep the earliest deadline among those
 	 * coalesced: the run that consumes them must start by it.

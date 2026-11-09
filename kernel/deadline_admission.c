@@ -44,6 +44,7 @@
 #include <kthread.h>
 #include <ksched.h>
 #include <deadline_admission.h>
+#include <timeout_q.h>
 
 #define BLOCKING_CYCLES \
 	((uint32_t)k_ns_to_cyc_ceil64(CONFIG_SCHED_DEADLINE_ADMISSION_BLOCKING_NS))
@@ -57,6 +58,8 @@ enum {
 };
 
 static sys_slist_t admitted;
+/* Armed recurring reservations (k_deadline_event_arm(), k_deadline_event_arm_periodic()). */
+static sys_slist_t reservations;
 
 struct sim_job {
 	struct k_deadline_event *event;
@@ -73,6 +76,18 @@ struct sim_job {
 	bool late;
 	/* Its deadline only orders it: a run latched behind the run in progress. */
 	bool ordering_only;
+	/* Running when the check started. */
+	bool running_at_check;
+	/* When the simulation started it, without interference. */
+	int32_t start;
+	/*
+	 * A recurring reservation, not a run: releases at any time, no two closer
+	 * than its minimum inter-arrival (plus its jitter), each @ref work of
+	 * thread time at its priority and its handler at interrupt level, started
+	 * within @ref deadline of its release. The simulation does not run it;
+	 * sim_bound() checks it.
+	 */
+	const struct k_deadline_reservation *res;
 };
 
 struct sim {
@@ -159,6 +174,7 @@ static bool sim_run(struct sim *s)
 			int32_t start = MAX(t, j->not_before);
 
 			j->started = true;
+			j->start = start;
 			/* Dispatched early, it spins at its priority until its not-before. */
 			j->remaining += (uint32_t)(start - t);
 			if (start - j->deadline > 0 && !j->ordering_only) {
@@ -177,6 +193,213 @@ static bool sim_run(struct sim *s)
 		t += run;
 	}
 	return ok;
+}
+
+/* Add @p res, a reservation of @p event, as a recurring job. */
+static void sim_add_reservation(struct sim *s, struct k_deadline_event *event,
+				const struct k_deadline_reservation *res)
+{
+	struct sim_job *j = sim_add(s);
+
+	if (j == NULL) {
+		return;
+	}
+	*j = (struct sim_job){
+		.event = event,
+		.deadline = (int32_t)res->deadline,
+		.work = res->budget,
+		.prio = event->consumer->base.prio,
+		.cooperative = event->consumer->base.prio < 0,
+		.res = res,
+	};
+}
+
+static bool is_metairq(int prio)
+{
+	return (CONFIG_NUM_METAIRQ_PRIORITIES > 0) &&
+	       (prio < K_HIGHEST_THREAD_PRIO + CONFIG_NUM_METAIRQ_PRIORITIES);
+}
+
+/*
+ * Releasing @p a enters the scheduler (the post that releases it is a
+ * scheduling point), so it takes the CPU at once from lower-priority @p b,
+ * unless the policy keeps @p b running there: a cooperative @p b keeps the CPU
+ * against everything but a meta-IRQ @p a.
+ */
+static bool preempts(const struct sim_job *a, const struct sim_job *b)
+{
+	return is_metairq(a->prio) || !b->cooperative;
+}
+
+/*
+ * The longest run that can hold the CPU against @p a once a has been
+ * released, because the policy does not switch to a there: a lower-priority
+ * job @p a does not preempt, and for a cooperative @p a the same-priority one-
+ * shot job that was released earlier with a later deadline (a run it would
+ * have followed, which interference can make start first).
+ */
+static uint32_t sim_blocker(const struct sim *s, const struct sim_job *a)
+{
+	uint32_t blocker = 0U;
+
+	for (size_t i = 0U; i < s->count; i++) {
+		const struct sim_job *k = &s->jobs[i];
+		bool blocks = false;
+
+		if (k == a) {
+			continue;
+		}
+		if (k->prio > a->prio) {
+			blocks = !preempts(a, k);
+		} else if (k->prio == a->prio && a->cooperative && a->res == NULL && k->res == NULL) {
+			blocks = !k->running_at_check && k->release < a->release &&
+				 k->deadline - a->deadline > 0;
+		}
+		if (blocks) {
+			blocker = MAX(blocker, k->work);
+		}
+	}
+	return blocker;
+}
+
+/*
+ * Recurring work that can run ahead of @p a in any interval of length @p x:
+ * every reservation other than a's, (floor((x + jitter) / period) + 1)
+ * releases, each its handler at interrupt level and, at a's priority or above,
+ * its run.
+ */
+static uint64_t sim_recurring(const struct sim *s, const struct sim_job *a, uint64_t x)
+{
+	uint64_t demand = 0U;
+
+	for (size_t i = 0U; i < s->count; i++) {
+		const struct sim_job *k = &s->jobs[i];
+		uint64_t releases;
+
+		if (k->res == NULL || k->event == a->event) {
+			continue;
+		}
+		releases = (x + k->res->jitter) / k->res->min_interarrival + 1U;
+		demand += releases * k->res->isr_budget;
+		if (k->prio <= a->prio) {
+			demand += releases * k->work;
+		}
+	}
+	return demand;
+}
+
+/* One-shot work released in (@p from, @p to] that runs ahead of @p a. */
+static uint64_t sim_released_ahead(const struct sim *s, const struct sim_job *a, int64_t from,
+				   int64_t to)
+{
+	uint64_t demand = 0U;
+
+	for (size_t i = 0U; i < s->count; i++) {
+		const struct sim_job *k = &s->jobs[i];
+
+		if (k == a || k->res != NULL || k->running_at_check) {
+			continue;
+		}
+		if (k->release <= from || k->release > to) {
+			continue;
+		}
+		if (k->prio < a->prio || (k->prio == a->prio && k->deadline - a->deadline <= 0)) {
+			demand += k->work;
+		}
+	}
+	return demand;
+}
+
+/* Least fixed point of x = base + demand(x), or a value past @p limit. */
+#define SIM_FIXED_POINT_STEPS 32U
+
+static int64_t sim_fixed_point(const struct sim *s, const struct sim_job *a, int64_t base,
+			       int64_t from, int64_t limit)
+{
+	int64_t x = base;
+
+	for (uint32_t step = 0U; step < SIM_FIXED_POINT_STEPS; step++) {
+		int64_t next = base + (int64_t)sim_recurring(s, a, (uint64_t)MAX(x, 0)) +
+			       ((from >= 0) ? (int64_t)sim_released_ahead(s, a, from, x) : 0);
+
+		if (next == x || next > limit) {
+			return next;
+		}
+		x = next;
+	}
+	/* Not settled: not proved. */
+	return limit + 1;
+}
+
+/*
+ * With reservations, the simulation's starts are not the whole story:
+ * releases of recurring jobs can come at any time. Check each job against
+ * them, conservatively:
+ *
+ * - A one-shot job the simulation starts at s, interference-free, starts by
+ *   the least x with x = s + B + R(x) + W(s, x): R the recurring work of an
+ *   interval of length x (sim_recurring(), counted from the check, so it
+ *   covers every phase), W the one-shot work released after s that runs ahead
+ *   of it, B one blocker the policy will not switch from (sim_blocker()).
+ *   Delaying a preemptive schedule by interference delays a start by at most
+ *   that interference; within a cooperative priority it can also reorder runs
+ *   (a run delayed past a later release lets that release start first and
+ *   hold the CPU), which B covers.
+ * - A recurring job, released at the worst moment, starts by the least x with
+ *   x = blocking + B + O + R(x): O all the one-shot work at its priority or
+ *   above (each runs once, wherever it falls), R the other reservations.
+ *
+ * Without reservations the simulation is exact and nothing is added.
+ */
+static bool sim_bound(struct sim *s)
+{
+	bool any = false;
+	bool ok = true;
+
+	for (size_t i = 0U; i < s->count; i++) {
+		any = any || (s->jobs[i].res != NULL);
+	}
+	if (!any) {
+		return true;
+	}
+	for (size_t i = 0U; i < s->count; i++) {
+		struct sim_job *j = &s->jobs[i];
+		int64_t x;
+
+		if (j->ordering_only || j->running_at_check || j->late) {
+			continue;
+		}
+		if (j->res != NULL) {
+			int64_t base = (int64_t)s->blocking + sim_blocker(s, j);
+
+			for (size_t k = 0U; k < s->count; k++) {
+				const struct sim_job *o = &s->jobs[k];
+
+				if (o->res == NULL && o->prio <= j->prio) {
+					base += o->work;
+				}
+			}
+			x = sim_fixed_point(s, j, base, -1, j->deadline);
+		} else if (!j->started) {
+			x = (int64_t)j->deadline + 1;
+		} else {
+			x = sim_fixed_point(s, j, (int64_t)j->start + sim_blocker(s, j), j->start,
+					    j->deadline);
+		}
+		if (x > j->deadline) {
+			j->late = true;
+			ok = false;
+		}
+	}
+	return ok;
+}
+
+/* Simulate, then bound against the reservations. */
+static bool sim_check(struct sim *s)
+{
+	bool ok = sim_run(s);
+
+	return sim_bound(s) && ok;
 }
 
 /*
@@ -209,6 +432,7 @@ static void sim_collect(struct sim *s, uint32_t now, const struct k_deadline_eve
 				break;
 			}
 			j->started = true;
+			j->running_at_check = true;
 			j->remaining = event->run_budget;
 			if (consumer == _current) {
 				uint32_t elapsed = now - event->run_start;
@@ -237,7 +461,9 @@ static void sim_collect(struct sim *s, uint32_t now, const struct k_deadline_eve
 					};
 				}
 			}
-		} else if (event->admission_state == ADMIT_PENDING && event != exclude) {
+		} else if (event->admission_state == ADMIT_PENDING && event != exclude &&
+			   event->reservation == NULL) {
+			/* An armed event's released run is one of its reservation's. */
 			j = sim_add(s);
 			if (j == NULL) {
 				break;
@@ -269,6 +495,12 @@ static void sim_collect(struct sim *s, uint32_t now, const struct k_deadline_eve
 			j->prio = consumer->base.prio;
 			j->cooperative = consumer->base.prio < 0;
 		}
+	}
+
+	struct k_deadline_reservation *res;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&reservations, res, node) {
+		sim_add_reservation(s, res->event, res);
 	}
 }
 
@@ -328,6 +560,7 @@ static bool admission_check(uint32_t now, const struct sim_job *extra,
 	static struct sim s;
 	const struct sim_job *victim;
 
+	verdict->kind = K_DEADLINE_MISS_UNSAT;
 	sim_collect(&s, now, NULL);
 	if (extra != NULL) {
 		struct sim_job *j = sim_add(&s);
@@ -345,7 +578,7 @@ static bool admission_check(uint32_t now, const struct sim_job *extra,
 		verdict->demand = 0U;
 		return false;
 	}
-	if (sim_run(&s)) {
+	if (sim_check(&s)) {
 		return true;
 	}
 	victim = sim_victim(&s);
@@ -359,7 +592,7 @@ static bool admission_check(uint32_t now, const struct sim_job *extra,
 	}
 	/* Admitted work is late: is it late without the request too? */
 	sim_collect(&s, now, (extra != NULL) ? NULL : requester);
-	if (s.overflow || sim_run(&s)) {
+	if (s.overflow || sim_check(&s)) {
 		verdict->victim = requester;
 		return false;
 	}
@@ -374,7 +607,7 @@ static bool admission_check(uint32_t now, const struct sim_job *extra,
 static void admission_report(const struct admission_verdict *verdict, struct k_thread *running)
 {
 	struct k_deadline_miss miss = {
-		.kind = K_DEADLINE_MISS_UNSAT,
+		.kind = verdict->kind,
 		.object = verdict->victim,
 		.name = (verdict->victim != NULL) ? verdict->victim->name : NULL,
 		.thread = (verdict->victim != NULL) ? verdict->victim->consumer : NULL,
@@ -401,6 +634,17 @@ void k_deadline_event_budget_set(struct k_deadline_event *event, uint32_t budget
 	z_sched_spinlock_unlock(key);
 }
 
+void z_deadline_admission_publication(const struct k_deadline_event *event, uint32_t now,
+				      int *deadline, uint32_t *budget)
+{
+	const struct k_deadline_reservation *res = event->reservation;
+
+	if (res != NULL) {
+		*deadline = (int)(now + res->deadline);
+		*budget = res->budget;
+	}
+}
+
 /*
  * A publication of @p event at @p now has been recorded; @p idle when it
  * released the consumer. Caller holds the scheduler lock. Returns false with
@@ -410,6 +654,34 @@ bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint
 				 struct admission_verdict *verdict)
 {
 	if (event->budget == 0U) {
+		return true;
+	}
+	if (event->reservation != NULL) {
+		struct k_deadline_reservation *res = event->reservation;
+
+		/*
+		 * A release of an armed event was admitted when it was armed: it is
+		 * never checked, and only a release outside the model is refused (the
+		 * reservation covers one run outstanding at a time, releases no closer
+		 * than its minimum inter-arrival). A periodic one's spacing is the
+		 * kernel's own.
+		 */
+		if (event->admission_state != ADMIT_IDLE ||
+		    (!res->periodic && res->released &&
+		     now - res->last_release < res->min_interarrival)) {
+			*verdict = (struct admission_verdict){
+				.kind = K_DEADLINE_MISS_OVERRUN,
+				.victim = event,
+				.now = now,
+				.release = now,
+				.deadline = event->deadline,
+			};
+			return false;
+		}
+		res->released = true;
+		res->last_release = now;
+		event->future = false;
+		event->admission_state = ADMIT_PENDING;
 		return true;
 	}
 	/* A timed release admitted when it was armed is now this publication. */
@@ -528,6 +800,128 @@ int k_deadline_demand_admit(int prio, uint32_t cycles)
 		return -ETIME;
 	}
 	return 0;
+}
+
+/*
+ * A periodic reservation's release. The next one is scheduled here, at the
+ * release, not when the run finishes: going back to sleep cannot fail.
+ */
+static void periodic_release(struct _timeout *timeout)
+{
+	struct k_deadline_reservation *res =
+		CONTAINER_OF(timeout, struct k_deadline_reservation, timeout);
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	bool armed = (res->event != NULL) && (res->event->reservation == res);
+
+	z_sched_spinlock_unlock(key);
+	if (!armed) {
+		return;
+	}
+	res->next_tick += res->period_ticks;
+	(void)z_add_timeout(&res->timeout, periodic_release, K_TIMEOUT_ABS_TICKS(res->next_tick));
+	/* The reservation sets the run's deadline and budget (z_deadline_admission_publication()). */
+	k_deadline_event_post(res->event, 0);
+}
+
+static int arm(struct k_deadline_event *event, struct k_deadline_reservation *res, bool periodic,
+	       uint32_t first)
+{
+	uint32_t now = k_cycle_get_32();
+	struct admission_verdict verdict;
+	struct sim_job candidate;
+	bool ok;
+	k_spinlock_key_t key;
+
+	if (event->consumer == NULL || res->budget == 0U || res->min_interarrival == 0U ||
+	    res->deadline > res->min_interarrival ||
+	    (uint64_t)res->budget + res->isr_budget > res->min_interarrival) {
+		/* A model that cannot hold: one run outstanding needs D <= T, and C + isr <= T. */
+		return -EINVAL;
+	}
+	res->periodic = periodic;
+	res->released = false;
+	res->jitter = 0U;
+	if (periodic) {
+		res->period_ticks = k_cyc_to_ticks_floor64(res->min_interarrival);
+		if (res->period_ticks == 0 ||
+		    k_ticks_to_cyc_floor64(res->period_ticks) != res->min_interarrival) {
+			return -EINVAL;
+		}
+		/* A release is announced up to one tick after its tick. */
+		res->jitter = k_ticks_to_cyc_ceil32(1);
+	}
+	key = z_sched_spinlock_lock();
+	if (event->reservation != NULL) {
+		z_sched_spinlock_unlock(key);
+		return -EINVAL;
+	}
+	uint32_t budget_before = event->budget;
+
+	if (budget_before == 0U) {
+		sys_slist_append(&admitted, &event->admission_node);
+	}
+	event->budget = res->budget;
+	candidate = (struct sim_job){
+		.event = event,
+		.deadline = (int32_t)res->deadline,
+		.work = res->budget,
+		.prio = event->consumer->base.prio,
+		.cooperative = event->consumer->base.prio < 0,
+		.res = res,
+	};
+	ok = admission_check(now, &candidate, event, &verdict);
+	if (ok) {
+		res->event = event;
+		event->reservation = res;
+		sys_slist_append(&reservations, &res->node);
+	} else {
+		event->budget = budget_before;
+		if (budget_before == 0U) {
+			(void)sys_slist_find_and_remove(&admitted, &event->admission_node);
+		}
+	}
+	z_sched_spinlock_unlock(key);
+	if (!ok) {
+		admission_report(&verdict, k_current_get());
+		return -ETIME;
+	}
+	if (periodic) {
+		/* The first release, then one every period from it (periodic_release()). */
+		int32_t until = (int32_t)(first - k_cycle_get_32());
+
+		res->next_tick = sys_clock_tick_get() +
+				 (k_ticks_t)k_cyc_to_ticks_ceil64((uint64_t)MAX(until, 0));
+		(void)z_add_timeout(&res->timeout, periodic_release,
+				    K_TIMEOUT_ABS_TICKS(res->next_tick));
+	}
+	return 0;
+}
+
+int k_deadline_event_arm(struct k_deadline_event *event,
+			 struct k_deadline_reservation *reservation)
+{
+	return arm(event, reservation, false, 0U);
+}
+
+int k_deadline_event_arm_periodic(struct k_deadline_event *event,
+				  struct k_deadline_reservation *reservation, uint32_t first)
+{
+	return arm(event, reservation, true, first);
+}
+
+void k_deadline_event_disarm(struct k_deadline_event *event)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	struct k_deadline_reservation *res = event->reservation;
+
+	if (res != NULL) {
+		(void)sys_slist_find_and_remove(&reservations, &res->node);
+		event->reservation = NULL;
+	}
+	z_sched_spinlock_unlock(key);
+	if (res != NULL && res->periodic) {
+		(void)z_try_abort_timeout(&res->timeout);
+	}
 }
 
 #ifdef CONFIG_CLOCK_EVENT_SCHED

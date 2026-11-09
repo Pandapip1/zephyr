@@ -37,6 +37,12 @@ enum k_deadline_miss_kind {
 	K_DEADLINE_MISS_DELIVERY,
 	/** A release was found infeasible before it ran (admission control). */
 	K_DEADLINE_MISS_UNSAT,
+	/**
+	 * An armed job was activated outside its declared arrival model: while an
+	 * instance was still outstanding, or sooner than its minimum inter-arrival
+	 * after the previous activation. The activation is refused.
+	 */
+	K_DEADLINE_MISS_OVERRUN,
 };
 
 /** One job run recorded for a report. */

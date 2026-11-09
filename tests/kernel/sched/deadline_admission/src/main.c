@@ -176,6 +176,7 @@ static void before(void *fixture)
 {
 	ARG_UNUSED(fixture);
 	for (int i = 0; i < JOBS; i++) {
+		k_deadline_event_disarm(&events[i]);
 		k_deadline_event_budget_set(&events[i], 0U);
 		run_us[i] = 0U;
 		runs[i] = 0;
@@ -787,6 +788,151 @@ ZTEST(deadline_admission, test_latched_publication_is_checked)
 	k_deadline_event_admit_cancel(&events[JOB_LOW]);
 	k_deadline_event_budget_set(&latch_event, 0U);
 	k_thread_abort(&latch_thread);
+}
+
+/* Recurring jobs: armed (sporadic) and periodic reservations. */
+
+static struct k_deadline_reservation res[JOBS];
+
+static struct k_deadline_reservation *reserve(enum job_id id, uint32_t budget_us, uint32_t t_us,
+					      uint32_t d_us)
+{
+	res[id] = (struct k_deadline_reservation){
+		.budget = US(budget_us),
+		.min_interarrival = US(t_us),
+		.deadline = US(d_us),
+	};
+	run_us[id] = 0U;
+	return &res[id];
+}
+
+static void activate(const void *param)
+{
+	k_deadline_event_post(&events[POINTER_TO_INT(param)], 0);
+}
+
+static void activate_twice(const void *param)
+{
+	k_deadline_event_post(&events[POINTER_TO_INT(param)], 0);
+	k_deadline_event_post(&events[POINTER_TO_INT(param)], 0);
+}
+
+/* Arming is the point that can fail: a model that cannot hold against what is armed is refused. */
+ZTEST(deadline_admission, test_arm_refused_when_infeasible)
+{
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 600U, 1000U, 1000U)));
+	/* Released at the worst moment, the low job waits behind 600 us of the high one. */
+	zassert_equal(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 100U, 1000U, 300U)),
+		      -ETIME);
+	zassert_equal(misses, 1);
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
+	zassert_equal_ptr(last_miss.object, &events[JOB_LOW]);
+	/* Refused, it is not armed: its release would be checked like any other. */
+	zassert_is_null(events[JOB_LOW].reservation);
+}
+
+/*
+ * Activation of an armed job is never checked and never refused; work that would break its
+ * reservation is refused instead, when it asks.
+ */
+ZTEST(deadline_admission, test_armed_activation_never_refused)
+{
+	uint32_t now;
+
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 100U, 1000U, 500U)));
+	budget(JOB_HIGH2, 800U);
+	now = k_cycle_get_32();
+	zassert_equal(k_deadline_event_admit(&events[JOB_HIGH2], now + US(100U), now + US(100U),
+					     (int)(now + US(5000U))),
+		      -ETIME, "work that would delay the armed job past its deadline was admitted");
+	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH2], "the request is refused");
+	k_deadline_event_admit_cancel(&events[JOB_HIGH2]);
+	misses = 0;
+
+	irq_offload(activate, INT_TO_POINTER(JOB_HIGH));
+	sleep_ms(2U);
+	zassert_equal(runs[JOB_HIGH], 1, "the activation did not run");
+	zassert_equal(misses, 0, "an activation was checked or refused");
+}
+
+/*
+ * Finishing a run returns an armed job to armed without a check: under a load that refuses a
+ * new arm, the armed job is activated again and again.
+ */
+ZTEST(deadline_admission, test_rearm_never_refused_under_load)
+{
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 200U, 1000U, 500U)));
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH2], reserve(JOB_HIGH2, 200U, 1000U, 500U)));
+	/* The load: a third reservation no longer fits. */
+	zassert_equal(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 200U, 1000U, 350U)),
+		      -ETIME);
+	misses = 0;
+	for (int i = 0; i < 5; i++) {
+		irq_offload(activate, INT_TO_POINTER(JOB_HIGH));
+		sleep_ms(2U);
+	}
+	zassert_equal(runs[JOB_HIGH], 5, "an armed job did not run on every activation");
+	zassert_equal(misses, 0, "a re-arm was checked or refused");
+}
+
+/*
+ * A periodic job is released by the kernel every period and goes back to sleep without a check,
+ * under the same load.
+ */
+ZTEST(deadline_admission, test_periodic_resleep_never_refused_under_load)
+{
+	uint32_t period = k_ticks_to_cyc_floor32(k_us_to_ticks_ceil32(5000U * scale));
+	int seen;
+
+	res[JOB_HIGH2] = (struct k_deadline_reservation){
+		.budget = US(50U),
+		.min_interarrival = period,
+		.deadline = period,
+	};
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 200U, 1000U, 500U)));
+	zassert_ok(k_deadline_event_arm_periodic(&events[JOB_HIGH2], &res[JOB_HIGH2],
+						 k_cycle_get_32() + period));
+	/* Behind 200 us of the armed job and 50 us of the periodic one: 250 us, past 240. */
+	zassert_equal(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 200U, 1000U, 240U)),
+		      -ETIME, "the load does not refuse a new arm");
+	misses = 0;
+	k_sleep(K_CYC(7U * period));
+	seen = runs[JOB_HIGH2];
+	zassert_true(seen >= 5, "periodic releases: %d in 7 periods", seen);
+	zassert_equal(misses, 0, "a re-sleep was checked or refused");
+
+	k_deadline_event_disarm(&events[JOB_HIGH2]);
+	seen = runs[JOB_HIGH2];
+	k_sleep(K_CYC(3U * period));
+	zassert_equal(runs[JOB_HIGH2], seen, "a disarmed periodic job was released");
+}
+
+/* Disarming releases the capacity: an arm refused before it is admitted after. */
+ZTEST(deadline_admission, test_disarm_releases_capacity)
+{
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 600U, 1000U, 1000U)));
+	zassert_equal(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 100U, 1000U, 300U)),
+		      -ETIME);
+	k_deadline_event_disarm(&events[JOB_HIGH]);
+	misses = 0;
+	zassert_ok(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 100U, 1000U, 300U)));
+	zassert_equal(misses, 0);
+}
+
+/*
+ * An activation outside the declared model (here a second one while the first is still
+ * outstanding, sooner than the minimum inter-arrival) is refused at its source and reported: it
+ * is demand no reservation covers.
+ */
+ZTEST(deadline_admission, test_activation_outside_model_is_overrun)
+{
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 100U, 5000U, 500U)));
+	irq_offload(activate_twice, INT_TO_POINTER(JOB_HIGH));
+	sleep_ms(2U);
+	zassert_equal(misses, 1);
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_OVERRUN);
+	zassert_equal_ptr(last_miss.object, &events[JOB_HIGH]);
+	zassert_equal(runs[JOB_HIGH], 1, "the refused activation ran");
 }
 
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);

@@ -1124,6 +1124,49 @@ __syscall void k_thread_priority_set(k_tid_t thread, int prio);
  *
  * @kconfig_dep{CONFIG_SCHED_DEADLINE}
  */
+struct k_deadline_event;
+
+#if defined(CONFIG_SCHED_DEADLINE_ADMISSION) || defined(__DOXYGEN__)
+/**
+ * @brief Capacity reserved for a recurring deadline event.
+ *
+ * Armed with k_deadline_event_arm() (sporadic: released by
+ * k_deadline_event_post() at any time, at most one instance outstanding and
+ * no two releases closer than @ref min_interarrival) or
+ * k_deadline_event_arm_periodic() (released by the kernel every @ref
+ * min_interarrival). Admission proves, when it is armed, that every release
+ * the model allows starts within @ref deadline whatever else is admitted, and
+ * keeps proving it for every later request until k_deadline_event_disarm():
+ * a release is never checked, and finishing a run never has to re-admit.
+ *
+ * Set the first four fields before arming; the rest are internal.
+ */
+struct k_deadline_reservation {
+	/** Worst-case execution time of one run, in @ref k_cycle_get_32 units. */
+	uint32_t budget;
+	/** Shortest time between two releases (the period of a periodic one). */
+	uint32_t min_interarrival;
+	/** Start-by deadline of each run, relative to its release. */
+	uint32_t deadline;
+	/**
+	 * Longest run of the interrupt handler that releases it (0 for none), at
+	 * interrupt level: interference on all thread work, once per release.
+	 */
+	uint32_t isr_budget;
+	/** @cond INTERNAL_HIDDEN */
+	sys_snode_t node;
+	struct k_deadline_event *event;
+	uint32_t last_release;
+	uint32_t jitter;
+	bool released;
+	bool periodic;
+	struct _timeout timeout;
+	k_ticks_t next_tick;
+	k_ticks_t period_ticks;
+	/** @endcond */
+};
+#endif
+
 struct k_deadline_event {
 	struct k_thread *consumer;
 	/* Earliest start-by deadline among the coalesced pending publications. */
@@ -1156,6 +1199,8 @@ struct k_deadline_event {
 	int future_deadline;
 	uint8_t admission_state;
 	bool future;
+	/* Capacity reserved while armed (k_deadline_event_arm()), or NULL. */
+	struct k_deadline_reservation *reservation;
 #endif
 #ifdef CONFIG_SCHED_DEADLINE_STATS
 	/* Longest run and longest release-to-start latency seen, cycles. */
@@ -1340,6 +1385,58 @@ void k_deadline_event_admit_cancel(struct k_deadline_event *event);
  * @retval -ETIME Infeasible; reported.
  */
 int k_deadline_demand_admit(int prio, uint32_t cycles);
+
+/**
+ * @brief Arm a sporadic recurring job: reserve capacity for its releases.
+ *
+ * Admits @p event's releases at any time under the model of @p reservation
+ * (see struct k_deadline_reservation) against all admitted work. Arming is the
+ * only point that can fail. Once armed, k_deadline_event_post() releases a run
+ * that is never checked (its start-by deadline is @c reservation->deadline from
+ * the release, its budget @c reservation->budget), and finishing the run
+ * returns it to armed without a check. A release outside the model is refused
+ * and reported as K_DEADLINE_MISS_OVERRUN.
+ *
+ * @param event Deadline event; its consumer must already wait on it.
+ * @param reservation Model of its releases, owned by the caller while armed.
+ *
+ * @retval 0 Armed.
+ * @retval -ETIME Infeasible; reported as K_DEADLINE_MISS_UNSAT for @p event.
+ * @retval -EINVAL No consumer, already armed, or a model that cannot hold.
+ */
+int k_deadline_event_arm(struct k_deadline_event *event,
+			 struct k_deadline_reservation *reservation);
+
+/**
+ * @brief Arm a periodic recurring job: the kernel releases it every period.
+ *
+ * As k_deadline_event_arm(), with @c reservation->min_interarrival the period
+ * (a whole number of kernel ticks) and the first release @p first. The kernel
+ * releases the run every period from then on; the next release is scheduled
+ * when one is made, never when a run finishes, so it cannot fail. A release
+ * that finds the previous run still outstanding is reported as
+ * K_DEADLINE_MISS_OVERRUN and dropped.
+ *
+ * @param event Deadline event; its consumer must already wait on it.
+ * @param reservation Model of its releases, owned by the caller while armed.
+ * @param first First release, in @ref k_cycle_get_32 units.
+ *
+ * @retval 0 Armed.
+ * @retval -ETIME Infeasible; reported as K_DEADLINE_MISS_UNSAT for @p event.
+ * @retval -EINVAL No consumer, already armed, or a period not in whole ticks.
+ */
+int k_deadline_event_arm_periodic(struct k_deadline_event *event,
+				  struct k_deadline_reservation *reservation, uint32_t first);
+
+/**
+ * @brief Release the capacity reserved by k_deadline_event_arm() or
+ *        k_deadline_event_arm_periodic().
+ *
+ * A periodic job is released no more. A run already released still runs.
+ *
+ * @param event Deadline event.
+ */
+void k_deadline_event_disarm(struct k_deadline_event *event);
 #endif
 
 #if defined(CONFIG_SCHED_DEADLINE_STATS) || defined(__DOXYGEN__)
