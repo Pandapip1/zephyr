@@ -54,6 +54,25 @@ enum k_deadline_miss_kind {
 	 * whose declaration does not cover the wake (the object is the job).
 	 */
 	K_DEADLINE_MISS_UNDECLARED,
+	/**
+	 * The scheduler clock failed a self-check (CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK):
+	 * the providers drifted apart beyond their bound, one stopped, a deep-provider
+	 * edge capture overran its window, or logical time stepped back. Reported to
+	 * k_clock_sync_fault_handler(), never through the miss policy. @ref
+	 * k_deadline_miss.demand is the k_clock_sync_reason, @ref k_deadline_miss.release
+	 * the expected and @ref k_deadline_miss.now the measured value, logical cycles.
+	 */
+	K_DEADLINE_MISS_CLOCK_SYNC,
+};
+
+/** What a scheduler clock self-check found (K_DEADLINE_MISS_CLOCK_SYNC). */
+enum k_clock_sync_reason {
+	/** The providers' counts over an interval differ beyond the drift bound. */
+	K_CLOCK_SYNC_DRIFT = 1,
+	/** A deep-provider edge did not come within two of its cycles. */
+	K_CLOCK_SYNC_CAPTURE,
+	/** Logical time stepped back. */
+	K_CLOCK_SYNC_MONOTONIC,
 };
 
 /** One job run recorded for a report. */
@@ -117,6 +136,19 @@ struct k_deadline_miss {
  * @param miss Description of the failure; valid only during the call.
  */
 void k_deadline_miss_handler(const struct k_deadline_miss *miss);
+
+/**
+ * @brief A scheduler clock self-check failed: the safe shutdown.
+ *
+ * Called inline, from the clock service with its lock held and often in an
+ * interrupt, for K_DEADLINE_MISS_CLOCK_SYNC; every timing assumption is void, so
+ * this is not the miss policy and must not depend on the scheduler clock, kernel
+ * timeouts or the scheduler. The default prints the report and panics; an
+ * application overrides it (a strong definition) with its own safe shutdown.
+ *
+ * @param miss Description of the failure; valid only during the call.
+ */
+void k_clock_sync_fault_handler(const struct k_deadline_miss *miss);
 
 /**
  * @brief Print a report of @p miss with printk().

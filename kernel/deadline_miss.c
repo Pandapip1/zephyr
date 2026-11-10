@@ -99,6 +99,8 @@ static const char *kind_name(enum k_deadline_miss_kind kind)
 		return "run past its budget";
 	case K_DEADLINE_MISS_UNDECLARED:
 		return "undeclared claim";
+	case K_DEADLINE_MISS_CLOCK_SYNC:
+		return "scheduler clock self-check failed";
 	default:
 		return "?";
 	}

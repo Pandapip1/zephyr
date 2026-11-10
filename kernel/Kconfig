@@ -371,6 +371,38 @@ config CLOCK_EVENT_SCHED_CLIENTS
 	  Number of events that can be bound with k_clock_event_sched_init().
 	  Each binds one event on the deep-sleep and one on the active provider.
 
+config CLOCK_EVENT_SCHED_SYNC_CHECK
+	bool "Validate the scheduler clock's providers against each other"
+	depends on CLOCK_EVENT_SCHED
+	help
+	  The clock service checks its own synchronisation, inline: while the
+	  active provider runs, the two providers' counts over each interval
+	  agree within CLOCK_EVENT_SCHED_SYNC_DRIFT_PPM (a stopped provider
+	  fails it); a deep-provider edge capture finishes within two deep
+	  cycles of the active provider; logical time never steps back. A
+	  failure is reported to k_clock_sync_fault_handler() as
+	  K_DEADLINE_MISS_CLOCK_SYNC, not through the per-job miss path,
+	  which measures with the clocks that just failed.
+
+config CLOCK_EVENT_SCHED_SYNC_DRIFT_PPM
+	int "Largest relative drift of the two providers (ppm)"
+	depends on CLOCK_EVENT_SCHED_SYNC_CHECK
+	default 550
+	help
+	  The sum of the two clocks' tolerances. The default: the active
+	  provider's crystal within the Bluetooth active-clock accuracy
+	  (50 ppm; a DPLL locked to it adds none on average), the deep
+	  provider within the Bluetooth sleep-clock accuracy (500 ppm), which
+	  also bounds an LFRCO in precision mode.
+
+config CLOCK_EVENT_SCHED_SYNC_INTERVAL_MS
+	int "Shortest interval a drift check judges (ms)"
+	depends on CLOCK_EVENT_SCHED_SYNC_CHECK
+	default 100
+	help
+	  Over a shorter interval the counts' quantisation (a deep cycle on
+	  each side) outweighs the drift bound.
+
 config CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS
 	int "Delivery lateness counted as a missed deadline (ns)"
 	default 61036

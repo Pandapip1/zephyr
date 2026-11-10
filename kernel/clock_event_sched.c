@@ -163,6 +163,44 @@ static uint64_t provider_lead_ns(const struct k_clock_event_provider *provider)
 	return convert_ceil(provider_min_arm(provider), provider_hz(provider), NSEC_PER_SEC);
 }
 
+/*
+ * Self-checks (CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK). Every timing guarantee rests on the
+ * providers agreeing, so they are checked against each other, inline, and a failure goes
+ * straight to the application's safe shutdown (k_clock_sync_fault_handler()), never to
+ * the miss policy, which measures with the clocks that just failed.
+ */
+void __weak k_clock_sync_fault_handler(const struct k_deadline_miss *miss)
+{
+	k_deadline_miss_print(miss);
+	k_panic();
+}
+
+/* A deep-provider cycle in logical cycles, once a deep provider is adopted. */
+static uint64_t sync_deep_cycle;
+/* Largest step back held so far, logical cycles (for reading over a debugger). */
+uint64_t z_clock_sync_backstep_max;
+/* The two providers' counts at the start of the interval being checked. */
+static struct {
+	uint32_t deep;
+	uint32_t active;
+	bool valid;
+} sync_ref __maybe_unused;
+
+static void sync_fault(enum k_clock_sync_reason reason, uint64_t expected, uint64_t measured)
+{
+	if (!IS_ENABLED(CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK)) {
+		return;
+	}
+	struct k_deadline_miss miss = {
+		.kind = K_DEADLINE_MISS_CLOCK_SYNC,
+		.release = (uint32_t)expected,
+		.now = (uint32_t)measured,
+		.demand = (uint32_t)reason,
+	};
+
+	k_clock_sync_fault_handler(&miss);
+}
+
 /* Logical time; caller holds sched_lock. */
 static uint64_t now_locked(void)
 {
@@ -184,8 +222,15 @@ static uint64_t now_locked(void)
 
 		now = deep_anchor.logical + scale_apply(deep_scale, delta);
 	}
-	/* Hand-offs between sources must never move time backwards. */
+	/*
+	 * Hand-offs between sources must never move time backwards: within the hand-off's
+	 * quantisation (two deep cycles) it is held; beyond it the clock has failed.
+	 */
 	if (now < last_now) {
+		z_clock_sync_backstep_max = MAX(z_clock_sync_backstep_max, last_now - now);
+		if (last_now - now > 2U * sync_deep_cycle) {
+			sync_fault(K_CLOCK_SYNC_MONOTONIC, last_now, now);
+		}
 		now = last_now;
 	}
 	last_now = now;
@@ -196,13 +241,67 @@ static uint64_t now_locked(void)
 static uint32_t deep_edge(void)
 {
 	uint32_t d0 = provider_now(deep_provider);
+	uint32_t a0 = active_bound ? provider_now(active_provider) : 0U;
+	/* The capture window: two deep cycles, timed by the other provider. */
+	uint32_t window = (uint32_t)convert_ceil(2U, deep_hz, active_hz);
 	uint32_t d1;
 
 	do {
 		d1 = provider_now(deep_provider);
+		if (IS_ENABLED(CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK) && active_bound &&
+		    provider_now(active_provider) - a0 > window) {
+			sync_fault(K_CLOCK_SYNC_CAPTURE, 2U * sync_deep_cycle,
+				   scale_apply(active_scale, provider_now(active_provider) - a0));
+			break;
+		}
 	} while (d1 == d0);
 	return d1;
 }
+
+/*
+ * The drift check, while the active provider runs: over each interval of at least
+ * CONFIG_CLOCK_EVENT_SCHED_SYNC_INTERVAL_MS, the two providers' counts in logical
+ * cycles differ by no more than the drift bound plus a deep cycle of quantisation at
+ * each end. A provider that stopped fails it. Caller holds sched_lock.
+ */
+#ifdef CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK
+static void sync_check_locked(void)
+{
+	if (!IS_ENABLED(CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK) || !active_bound || !on_active ||
+	    deep_provider == NULL) {
+		return;
+	}
+	uint32_t deep = provider_now(deep_provider);
+	uint32_t active = provider_now(active_provider);
+
+	if (!sync_ref.valid) {
+		sync_ref.deep = deep;
+		sync_ref.active = active;
+		sync_ref.valid = true;
+		return;
+	}
+	uint64_t by_deep = scale_apply(deep_scale, deep - sync_ref.deep);
+	uint64_t by_active = scale_apply(active_scale, active - sync_ref.active);
+	uint64_t span = MAX(by_deep, by_active);
+	uint64_t interval = (uint64_t)LOGICAL_HZ * CONFIG_CLOCK_EVENT_SCHED_SYNC_INTERVAL_MS / 1000U;
+
+	if (span < interval) {
+		return;
+	}
+	uint64_t bound = span * CONFIG_CLOCK_EVENT_SCHED_SYNC_DRIFT_PPM / 1000000U +
+			 2U * sync_deep_cycle;
+
+	if ((by_active > by_deep ? by_active - by_deep : by_deep - by_active) > bound) {
+		sync_fault(K_CLOCK_SYNC_DRIFT, by_deep, by_active);
+	}
+	sync_ref.deep = deep;
+	sync_ref.active = active;
+}
+#else
+static inline void sync_check_locked(void)
+{
+}
+#endif
 
 /*
  * Anchor both providers to the current logical time at a deep edge. With
@@ -753,6 +852,7 @@ static void hw_expired(struct k_clock_event *event, uint32_t generation, void *u
 		servicing = (event == &deep_hw) ? 'D' : 'A';
 		trace(servicing, NULL, now_locked(), 0U);
 		n = service_locked(fired);
+		sync_check_locked();
 		servicing = 0;
 	}
 	deliver(fired, n);
@@ -782,6 +882,7 @@ static void select_locked(void)
 				deep_inverse = inverse_for(deep_hz);
 				/* One extra deep cycle covers rounding a target up to a deep edge. */
 				deep_floor = convert_ceil(deep_min + 1U, deep_hz, LOGICAL_HZ);
+				sync_deep_cycle = convert_ceil(1U, deep_hz, LOGICAL_HZ);
 				wake_budget = convert_ceil(CONFIG_CLOCK_EVENT_SCHED_DEEP_WAKE_NS,
 							   NSEC_PER_SEC, LOGICAL_HZ);
 				client_min = MAX(1U, (uint32_t)convert_ceil(deep_min, deep_hz,
@@ -892,6 +993,51 @@ int k_clock_event_sched_init(struct k_clock_event *event, k_clock_event_handler_
 	return k_clock_event_init(event, &sched_backend, c, handler, user_data);
 }
 
+#ifdef CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK
+/*
+ * The checks' own client: while the active provider runs, a check at least every
+ * interval, delivered by the deep provider (its lead is far past the deep floor), so a
+ * stopped active provider is caught even when nothing else would wake the CPU. One
+ * scheduler clock client.
+ */
+static struct k_clock_event sync_ce;
+static bool sync_ce_bound;
+
+static void sync_ce_arm(void)
+{
+	uint64_t interval = (uint64_t)LOGICAL_HZ * CONFIG_CLOCK_EVENT_SCHED_SYNC_INTERVAL_MS / 1000U;
+
+	if (sync_ce_bound) {
+		(void)k_clock_event_arm_abs(&sync_ce,
+					    (uint32_t)(k_clock_event_sched_now() + interval));
+	}
+}
+
+static void sync_ce_expired(struct k_clock_event *event, uint32_t generation, void *user_data)
+{
+	ARG_UNUSED(event);
+	ARG_UNUSED(generation);
+	ARG_UNUSED(user_data);
+	K_SPINLOCK(&sched_lock) {
+		sync_check_locked();
+	}
+	sync_ce_arm();
+}
+
+static int sync_ce_init(void)
+{
+	sync_ce_bound = k_clock_event_sched_init(&sync_ce, sync_ce_expired, NULL) == 0;
+	sync_ce_arm();
+	return 0;
+}
+
+SYS_INIT(sync_ce_init, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
+#else
+static inline void sync_ce_arm(void)
+{
+}
+#endif
+
 #ifdef CONFIG_PM
 /*
  * The active provider may stop in any state deeper than runtime idle: carry
@@ -902,9 +1048,16 @@ static void sched_pm_entry(enum pm_state state)
 	if (state == PM_STATE_RUNTIME_IDLE || !active_bound) {
 		return;
 	}
+#ifdef CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK
+	/* Only one clock runs from here: nothing to check it against, no wake to spend. */
+	if (sync_ce_bound) {
+		k_clock_event_cancel(&sync_ce);
+	}
+#endif
 	K_SPINLOCK(&sched_lock) {
 		anchor_locked(true);
 		on_active = false;
+		sync_ref.valid = false;
 	}
 }
 
@@ -917,6 +1070,7 @@ static void sched_pm_exit(enum pm_state state)
 		anchor_locked(true);
 		on_active = true;
 	}
+	sync_ce_arm();
 }
 
 static struct pm_notifier sched_pm_notifier = {
