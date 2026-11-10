@@ -74,4 +74,10 @@ static inline void z_deadline_admission_report(const struct admission_verdict *v
 }
 #endif
 
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
+/* Around an interrupt handler (arch interrupt entry): arrival and handler checks. */
+void z_deadline_irq_enter(int32_t irq);
+void z_deadline_irq_exit(void);
+#endif
+
 #endif /* ZEPHYR_KERNEL_INCLUDE_DEADLINE_ADMISSION_H_ */

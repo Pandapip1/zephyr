@@ -1,0 +1,7 @@
+tests:
+  kernel.scheduler.deadline_irq_budget:
+    tags: kernel
+    arch_allow: arm
+    filter: CONFIG_CPU_CORTEX_M
+    integration_platforms:
+      - mps2/an385

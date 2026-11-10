@@ -175,6 +175,7 @@ static void *setup(void)
 static void before(void *fixture)
 {
 	ARG_UNUSED(fixture);
+	k_irq_unreserve(7U);
 	for (int i = 0; i < JOBS; i++) {
 		k_deadline_event_disarm(&events[i]);
 		k_deadline_event_budget_set(&events[i], 0U);
@@ -956,6 +957,36 @@ ZTEST(deadline_admission, test_busy_period_bound_for_a_far_release)
 					     (int)(now + US(5050U))),
 		      -ETIME, "a window shorter than one release of the armed job was admitted");
 	k_deadline_event_admit_cancel(&events[JOB_LOW]);
+}
+
+/*
+ * A reserved interrupt line is interference on every job: one that would push an armed job past
+ * its deadline is refused when reserved, a smaller one is admitted, and unreserving releases it.
+ */
+#define TEST_IRQ_LINE 7U
+
+static struct k_deadline_reservation irq_res;
+
+ZTEST(deadline_admission, test_irq_reservation_is_interference)
+{
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 100U, 1000U, 120U)));
+	irq_res = (struct k_deadline_reservation){
+		.isr_budget = US(150U),
+		.min_interarrival = US(1000U),
+	};
+	zassert_equal(k_irq_reserve(TEST_IRQ_LINE, &irq_res), -ETIME,
+		      "a line that delays the armed job's start 150 us past its 120 was reserved");
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
+	misses = 0;
+	irq_res.isr_budget = US(50U);
+	zassert_ok(k_irq_reserve(TEST_IRQ_LINE, &irq_res));
+	/* Now a second armed job no longer fits: 100 + 50 ahead of a 120 us deadline. */
+	zassert_equal(k_deadline_event_arm(&events[JOB_HIGH2], reserve(JOB_HIGH2, 10U, 1000U, 120U)),
+		      -ETIME);
+	k_irq_unreserve(TEST_IRQ_LINE);
+	misses = 0;
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH2], reserve(JOB_HIGH2, 10U, 1000U, 120U)),
+		   "unreserving the line did not release its capacity");
 }
 
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);

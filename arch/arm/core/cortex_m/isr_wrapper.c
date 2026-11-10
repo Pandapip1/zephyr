@@ -17,6 +17,9 @@
 #include <zephyr/irq.h>
 #include <zephyr/pm/pm.h>
 #include <cmsis_core.h>
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
+#include <deadline_admission.h>
+#endif
 
 /**
  *
@@ -76,6 +79,10 @@ void _isr_wrapper(void)
 	 */
 	irq_number -= 16;
 
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
+	z_deadline_irq_enter(irq_number);
+#endif
+
 #if defined(CONFIG_GEN_SW_ISR_TABLE_ARRAY)
 	const struct _isr_table_entry *entry = &_sw_isr_table[irq_number];
 	(entry->isr)(entry->arg);
@@ -88,6 +95,10 @@ void _isr_wrapper(void)
 
 #if defined(CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER)
 	z_soc_irq_eoi(irq_number);
+#endif
+
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
+	z_deadline_irq_exit();
 #endif
 
 #ifdef CONFIG_TRACING_ISR

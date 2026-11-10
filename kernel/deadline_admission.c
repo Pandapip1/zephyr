@@ -239,12 +239,13 @@ static void sim_add_reservation(struct sim *s, struct k_deadline_event *event,
 	if (j == NULL) {
 		return;
 	}
+	/* An interrupt line's (no event) has no thread work, only its handler. */
 	*j = (struct sim_job){
 		.event = event,
 		.deadline = (int32_t)res->deadline,
-		.work = res->budget,
-		.prio = event->consumer->base.prio,
-		.cooperative = event->consumer->base.prio < 0,
+		.work = (event != NULL) ? res->budget : 0U,
+		.prio = (event != NULL) ? event->consumer->base.prio : K_HIGHEST_THREAD_PRIO - 1,
+		.cooperative = (event != NULL) && (event->consumer->base.prio < 0),
 		.res = res,
 	};
 }
@@ -472,7 +473,9 @@ static bool sim_bound(struct sim *s)
 		struct sim_job *j = &s->jobs[i];
 		int64_t x;
 
-		if (j->ordering_only || j->running_at_check || j->late) {
+		if (j->ordering_only || j->running_at_check || j->late ||
+		    (j->res != NULL && j->event == NULL)) {
+			/* An interrupt line has no deadline of its own: only interference. */
 			continue;
 		}
 		if (j->res != NULL) {
@@ -946,6 +949,7 @@ static int arm(struct k_deadline_event *event, struct k_deadline_reservation *re
 	res->periodic = periodic;
 	res->released = false;
 	res->jitter = 0U;
+	res->irq = -1;
 	if (periodic) {
 		res->period_ticks = k_cyc_to_ticks_floor64(res->min_interarrival);
 		if (res->period_ticks == 0 ||
@@ -1028,6 +1032,143 @@ void k_deadline_event_disarm(struct k_deadline_event *event)
 		(void)z_try_abort_timeout(&res->timeout);
 	}
 }
+
+/* The reservation of interrupt line @p irq, or NULL. Caller holds the scheduler lock or runs in
+ * the line's own interrupt (reservations change only with interrupts locked).
+ */
+static struct k_deadline_reservation *irq_reservation(int32_t irq)
+{
+	struct k_deadline_reservation *res;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&reservations, res, node) {
+		if (res->event == NULL && res->irq == irq) {
+			return res;
+		}
+	}
+	return NULL;
+}
+
+int k_irq_reserve(unsigned int irq, struct k_deadline_reservation *reservation)
+{
+	uint32_t now = k_cycle_get_32();
+	struct admission_verdict verdict;
+	struct sim_job candidate;
+	bool ok;
+	k_spinlock_key_t key;
+
+	if (reservation->isr_budget == 0U || reservation->min_interarrival == 0U ||
+	    reservation->isr_budget > reservation->min_interarrival) {
+		return -EINVAL;
+	}
+	reservation->event = NULL;
+	reservation->irq = (int32_t)irq;
+	reservation->released = false;
+	reservation->periodic = false;
+	reservation->jitter = 0U;
+	reservation->deadline = reservation->min_interarrival;
+	key = z_sched_spinlock_lock();
+	if (irq_reservation((int32_t)irq) != NULL) {
+		z_sched_spinlock_unlock(key);
+		return -EINVAL;
+	}
+	candidate = (struct sim_job){
+		.deadline = (int32_t)reservation->deadline,
+		.prio = K_HIGHEST_THREAD_PRIO - 1,
+		.res = reservation,
+	};
+	ok = admission_check(now, &candidate, NULL, &verdict);
+	if (ok) {
+		sys_slist_append(&reservations, &reservation->node);
+	}
+	z_sched_spinlock_unlock(key);
+	if (!ok) {
+		admission_report(&verdict, k_current_get());
+		return -ETIME;
+	}
+	return 0;
+}
+
+void k_irq_unreserve(unsigned int irq)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	struct k_deadline_reservation *res = irq_reservation((int32_t)irq);
+
+	if (res != NULL) {
+		(void)sys_slist_find_and_remove(&reservations, &res->node);
+	}
+	z_sched_spinlock_unlock(key);
+}
+
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
+/*
+ * Arrival and handler checks of the reserved interrupt lines, from the
+ * interrupt entry (arch: _isr_wrapper). One frame per nesting level: a
+ * handler's own time excludes the handlers that interrupted it.
+ */
+#define IRQ_NEST_MAX 8U
+
+static struct {
+	uint32_t start;
+	uint32_t nested;
+	struct k_deadline_reservation *res;
+} irq_nest[IRQ_NEST_MAX];
+static uint8_t irq_depth;
+
+static void irq_report(const struct k_deadline_reservation *res, uint32_t now)
+{
+	struct k_deadline_miss miss = {
+		.kind = K_DEADLINE_MISS_OVERRUN,
+		.object = res,
+		.now = now,
+		.release = now,
+		.deadline = (int)now,
+	};
+
+	z_deadline_miss_report(&miss);
+}
+
+void z_deadline_irq_enter(int32_t irq)
+{
+	uint32_t now = k_cycle_get_32();
+	struct k_deadline_reservation *res = irq_reservation(irq);
+
+	if (res != NULL) {
+		if (res->released && now - res->last_release < res->min_interarrival) {
+			irq_report(res, now);
+		}
+		res->released = true;
+		res->last_release = now;
+	} else if (IS_ENABLED(CONFIG_SCHED_DEADLINE_IRQ_STRICT)) {
+		/* A line no admission check counts. */
+		irq_report(NULL, now);
+	}
+	if (irq_depth < IRQ_NEST_MAX) {
+		irq_nest[irq_depth].start = now;
+		irq_nest[irq_depth].nested = 0U;
+		irq_nest[irq_depth].res = res;
+	}
+	irq_depth++;
+}
+
+void z_deadline_irq_exit(void)
+{
+	uint32_t now = k_cycle_get_32();
+	uint8_t depth = --irq_depth;
+
+	if (depth >= IRQ_NEST_MAX) {
+		return;
+	}
+	uint32_t elapsed = now - irq_nest[depth].start;
+	struct k_deadline_reservation *res = irq_nest[depth].res;
+
+	if (depth > 0U) {
+		irq_nest[depth - 1U].nested += elapsed;
+	}
+	if (res != NULL && elapsed - irq_nest[depth].nested > res->isr_budget) {
+		irq_report(res, now);
+	}
+}
+#endif
 
 #ifdef CONFIG_CLOCK_EVENT_SCHED
 int k_deadline_event_admit_plan(struct k_deadline_event *event,

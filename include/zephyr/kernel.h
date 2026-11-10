@@ -1163,6 +1163,8 @@ struct k_deadline_reservation {
 	struct _timeout timeout;
 	k_ticks_t next_tick;
 	k_ticks_t period_ticks;
+	/* Interrupt line of k_irq_reserve(), or -1. */
+	int32_t irq;
 	/** @endcond */
 };
 #endif
@@ -1437,6 +1439,36 @@ int k_deadline_event_arm_periodic(struct k_deadline_event *event,
  * @param event Deadline event.
  */
 void k_deadline_event_disarm(struct k_deadline_event *event);
+
+/**
+ * @brief Reserve capacity for an interrupt line.
+ *
+ * Declares that @p irq fires no sooner than @c reservation->min_interarrival
+ * after its previous arrival and that its handler runs at most
+ * @c reservation->isr_budget (nested interrupts excluded). Admission counts
+ * the line as interference on all thread work, checked now against everything
+ * admitted and by every later request. @c budget and @c deadline are unused.
+ *
+ * With CONFIG_SCHED_DEADLINE_IRQ_BUDGETS the kernel checks every arrival of
+ * the line: one sooner than the declared inter-arrival, or a handler run
+ * longer than its budget, is reported as K_DEADLINE_MISS_OVERRUN with the
+ * reservation as the object.
+ *
+ * @param irq Interrupt line.
+ * @param reservation Its model, owned by the caller while reserved.
+ *
+ * @retval 0 Reserved.
+ * @retval -ETIME Infeasible; reported as K_DEADLINE_MISS_UNSAT.
+ * @retval -EINVAL A model that cannot hold, or the line already reserved.
+ */
+int k_irq_reserve(unsigned int irq, struct k_deadline_reservation *reservation);
+
+/**
+ * @brief Release the capacity reserved by k_irq_reserve() for @p irq.
+ *
+ * @param irq Interrupt line.
+ */
+void k_irq_unreserve(unsigned int irq);
 #endif
 
 #if defined(CONFIG_SCHED_DEADLINE_STATS) || defined(__DOXYGEN__)

@@ -200,6 +200,24 @@ config SCHED_DEADLINE_ADMISSION_BLOCKING_NS
 	  scheduler locked, and interrupt handling. Taken once at the start of
 	  every check.
 
+config SCHED_DEADLINE_IRQ_BUDGETS
+	bool "Check interrupt lines against their reservations"
+	depends on SCHED_DEADLINE_ADMISSION && CPU_CORTEX_M
+	help
+	  At every interrupt through the common entry, check the line against
+	  its reservation (k_irq_reserve()): an arrival sooner than its
+	  minimum inter-arrival, or a handler (nested ones excluded) longer
+	  than its budget, is reported as K_DEADLINE_MISS_OVERRUN. Direct
+	  interrupts bypass the common entry and are not checked.
+
+config SCHED_DEADLINE_IRQ_STRICT
+	bool "Report interrupts of unreserved lines"
+	depends on SCHED_DEADLINE_IRQ_BUDGETS
+	help
+	  An interrupt through the common entry on a line without a
+	  reservation is reported as K_DEADLINE_MISS_OVERRUN with no object:
+	  admission does not count it, so no guarantee covers it.
+
 config SCHED_DEADLINE_ADMISSION_JOBS
 	int "Jobs in one admission check"
 	depends on SCHED_DEADLINE_ADMISSION
