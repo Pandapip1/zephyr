@@ -23,3 +23,58 @@ config CLOCK_EVENT_SYSTEM_TIMER_MAX_TIMEOUT_MS
 	  Upper bound for one hardware arm. Each deep-sleep expiry re-anchors the
 	  providers, so this also bounds how long their relative drift can
 	  accumulate while the CPU is awake.
+
+config CLOCK_EVENT_SYSTEM_TIMER_JOB
+	bool "Kernel timeouts expire in a deadline job"
+	depends on CLOCK_EVENT_SYSTEM_TIMER
+	depends on SCHED_DEADLINE && !SMP && !TIMESLICING
+	help
+	  The clock-event interrupt only releases a deadline job, which
+	  announces the elapsed ticks: kernel timeout callbacks (thread
+	  wake-ups, k_timer handlers, delayed work) run in that job instead of
+	  in the interrupt (k_is_in_isr() is false there; timer_api's
+	  test_timer_expiry_in_isr fails by design). Announcements are at least
+	  CLOCK_EVENT_SYSTEM_TIMER_JOB_MIN_INTERARRIVAL_NS apart: a timeout due
+	  sooner after the last one is served at that spacing.
+
+if CLOCK_EVENT_SYSTEM_TIMER_JOB
+
+config CLOCK_EVENT_SYSTEM_TIMER_JOB_PRIORITY
+	int "Priority of the announcing job"
+	default -1
+	range -128 -1
+	help
+	  A cooperative priority: a timeout callback runs to completion before
+	  another thread anchors a timeout of its own.
+
+config CLOCK_EVENT_SYSTEM_TIMER_JOB_STACK_SIZE
+	int "Stack size of the announcing job"
+	default 512
+
+config CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS
+	int "Start-by of an announcement after its expiry (ns)"
+	default 1000000
+	help
+	  The deadline each expiry releases the announcing job with.
+
+config CLOCK_EVENT_SYSTEM_TIMER_JOB_MIN_INTERARRIVAL_NS
+	int "Shortest time between two announcements (ns)"
+	default 1000000
+	help
+	  Must be at least CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS.
+
+config CLOCK_EVENT_SYSTEM_TIMER_JOB_BUDGET_NS
+	int "Worst-case run of one announcement (ns)"
+	default 0
+	help
+	  Nonzero arms the announcing job (k_deadline_event_arm()) with this
+	  budget, CLOCK_EVENT_SYSTEM_TIMER_JOB_MIN_INTERARRIVAL_NS and
+	  CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS, and
+	  CLOCK_EVENT_SYSTEM_TIMER_JOB_ISR_NS as the interrupt that releases
+	  it. 0 leaves it outside admission.
+
+config CLOCK_EVENT_SYSTEM_TIMER_JOB_ISR_NS
+	int "Interrupt handling of one expiry (ns)"
+	default 0
+
+endif # CLOCK_EVENT_SYSTEM_TIMER_JOB

@@ -1429,6 +1429,12 @@ static int arm(struct k_deadline_event *event, struct k_deadline_reservation *re
 		}
 		/* A release is announced up to one tick after its tick. */
 		res->jitter = k_ticks_to_cyc_ceil32(1);
+#ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB
+		/* Then the announcing job serves it: spaced, started by its deadline, its run. */
+		res->jitter += k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_MIN_INTERARRIVAL_NS +
+						  CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS +
+						  CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_BUDGET_NS);
+#endif
 	}
 	key = z_sched_spinlock_lock();
 	if (event->reservation != NULL) {

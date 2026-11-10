@@ -38,8 +38,19 @@ static uint32_t announce_remaining;
  */
 static int announcing_cpu = -1;
 
+/*
+ * With CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB a thread announces, and a thread or
+ * interrupt that preempts it is not at the tick edge: only the announcing
+ * thread's own callbacks are.
+ */
+static struct k_thread *announcing_thread;
+
 static inline bool this_cpu_announcing(void)
 {
+	if (IS_ENABLED(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB)) {
+		return announcing_cpu == CPU_ID && !arch_is_in_isr() &&
+		       announcing_thread == _current;
+	}
 	return announcing_cpu == CPU_ID;
 }
 
@@ -94,7 +105,8 @@ static uint32_t elapsed(void)
 		return 0U;
 	}
 	return sys_clock_elapsed() +
-	       (IS_ENABLED(CONFIG_SMP) ? announce_remaining : 0);
+	       ((IS_ENABLED(CONFIG_SMP) || IS_ENABLED(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB)) ?
+		announce_remaining : 0);
 }
 
 /*
@@ -356,6 +368,7 @@ void sys_clock_announce_locked(uint32_t ticks, k_spinlock_key_t key)
 
 	announce_remaining = ticks;
 	announcing_cpu = CPU_ID;
+	announcing_thread = _current;
 
 #ifdef _TIMEOUT_BACKEND_OWNS_ANNOUNCE
 	/* The backend (timer wheel) runs the firing loop itself: its per-tick
