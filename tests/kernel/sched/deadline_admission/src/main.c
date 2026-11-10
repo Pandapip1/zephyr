@@ -989,4 +989,26 @@ ZTEST(deadline_admission, test_irq_reservation_is_interference)
 		   "unreserving the line did not release its capacity");
 }
 
+/*
+ * Fixed-priority admission refuses a set another order satisfies. Both released at +100 us: the
+ * low job (100 us) must start by +400 us, the high one (500 us) by +5000 us. Fixed priority runs
+ * the high job first and the low one starts at +600 us, late; the order low then high starts them
+ * at +100 us and +200 us, both in time. Admission simulates fixed priority only, so it refuses the
+ * high release although the set is satisfiable.
+ */
+ZTEST(deadline_admission, test_fixed_priority_refuses_a_satisfiable_set)
+{
+	uint32_t now = k_cycle_get_32();
+
+	budget(JOB_LOW, 100U);
+	budget(JOB_HIGH, 500U);
+	zassert_ok(k_deadline_event_admit(&events[JOB_LOW], now + US(100U), now + US(100U),
+					  (int)(now + US(400U))));
+	zassert_equal(k_deadline_event_admit(&events[JOB_HIGH], now + US(100U), now + US(100U),
+					     (int)(now + US(5000U))),
+		      -ETIME, "admission accepted a set fixed priority cannot meet");
+	k_deadline_event_admit_cancel(&events[JOB_LOW]);
+	k_deadline_event_admit_cancel(&events[JOB_HIGH]);
+}
+
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);
