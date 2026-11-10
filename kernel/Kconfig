@@ -200,6 +200,18 @@ config SCHED_DEADLINE_ADMISSION_BLOCKING_NS
 	  scheduler locked, and interrupt handling. Taken once at the start of
 	  every check.
 
+config SCHED_DEADLINE_BUDGET_ENFORCE
+	bool "Enforce the budget of every admitted run"
+	depends on SCHED_DEADLINE_ADMISSION
+	select INSTRUMENT_THREAD_SWITCHING
+	help
+	  Track the execution time of every run of a deadline event with a
+	  budget, excluding the time it is switched out and, with
+	  SCHED_DEADLINE_IRQ_BUDGETS, interrupt handling. One kernel timeout
+	  is armed for the remaining budget of the run being switched in; a
+	  run found past its budget is reported once as
+	  K_DEADLINE_MISS_BUDGET. Detection is at kernel tick granularity.
+
 config SCHED_DEADLINE_IRQ_BUDGETS
 	bool "Check interrupt lines against their reservations"
 	depends on SCHED_DEADLINE_ADMISSION && CPU_CORTEX_M

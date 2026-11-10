@@ -16,6 +16,7 @@
 #include <zephyr/sys/math_extras.h>
 #include <zephyr/sys/clock.h>
 #include <ksched.h>
+#include <deadline_admission.h>
 #include <kthread.h>
 #include <wait_q.h>
 #include <timeout_q.h>
@@ -1371,6 +1372,10 @@ void z_thread_mark_switched_in(void)
 	z_sched_usage_start(_current);
 #endif /* CONFIG_SCHED_THREAD_USAGE && !CONFIG_USE_SWITCH */
 
+#ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
+	z_deadline_budget_switched_in();
+#endif
+
 #ifdef CONFIG_TRACING
 	SYS_PORT_TRACING_FUNC(k_thread, switched_in);
 #endif /* CONFIG_TRACING */
@@ -1381,6 +1386,10 @@ void z_thread_mark_switched_out(void)
 #if defined(CONFIG_SCHED_THREAD_USAGE) && !defined(CONFIG_USE_SWITCH)
 	z_sched_usage_stop();
 #endif /*CONFIG_SCHED_THREAD_USAGE && !CONFIG_USE_SWITCH */
+
+#ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
+	z_deadline_budget_switched_out();
+#endif
 
 #ifdef CONFIG_TRACING
 #ifdef CONFIG_THREAD_LOCAL_STORAGE

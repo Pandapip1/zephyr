@@ -1,0 +1,5 @@
+tests:
+  kernel.scheduler.deadline_budget:
+    tags: kernel
+    integration_platforms:
+      - native_sim

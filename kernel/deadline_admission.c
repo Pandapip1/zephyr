@@ -60,6 +60,11 @@ enum {
 static sys_slist_t admitted;
 /* Armed recurring reservations (k_deadline_event_arm(), k_deadline_event_arm_periodic()). */
 static sys_slist_t reservations;
+/*
+ * Time spent in interrupt handlers, outermost ones so each is counted once
+ * (the entry checks, CONFIG_SCHED_DEADLINE_IRQ_BUDGETS; 0 without them).
+ */
+static uint32_t irq_time __maybe_unused;
 
 struct sim_job {
 	struct k_deadline_event *event;
@@ -813,12 +818,113 @@ bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint
 	return admission_check(now, NULL, event, verdict);
 }
 
+#ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
+/*
+ * Budget enforcement. A run's own time is its wall time less the time it
+ * was switched out and the interrupt time while it ran. One timeout, armed
+ * whenever a budgeted run is switched in, expires at its remaining budget;
+ * a run then found past its budget is reported once. A run switched out
+ * leaves the timeout armed: its expiry checks whatever runs then.
+ */
+static struct _timeout budget_timeout;
+
+/* The budgeted run in progress on @p thread, or NULL. */
+static struct k_deadline_event *budget_run(struct k_thread *thread)
+{
+	struct k_deadline_event *event;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&admitted, event, admission_node) {
+		if (event->consumer == thread && event->admission_state == ADMIT_RUNNING) {
+			return event;
+		}
+	}
+	return NULL;
+}
+
+static uint32_t budget_used(const struct k_deadline_event *event, uint32_t now)
+{
+	return (now - event->run_start) - event->run_preempted - (irq_time - event->run_irq_mark);
+}
+
+static void budget_expired(struct _timeout *timeout);
+
+static void budget_arm(struct k_deadline_event *event, uint32_t now)
+{
+	uint32_t used = budget_used(event, now);
+	uint32_t left = (used < event->run_budget) ? event->run_budget - used : 0U;
+
+	(void)z_try_abort_timeout(&budget_timeout);
+	/* A timeout never fires early; one more tick covers rounding to the tick. */
+	(void)z_add_timeout(&budget_timeout, budget_expired,
+			    Z_TIMEOUT_TICKS((k_ticks_t)k_cyc_to_ticks_ceil32(left) + 1));
+}
+
+static void budget_expired(struct _timeout *timeout)
+{
+	uint32_t now = k_cycle_get_32();
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	struct k_deadline_event *event = budget_run(_current);
+	struct k_deadline_miss miss;
+	bool over = false;
+
+	ARG_UNUSED(timeout);
+	if (event != NULL && !event->run_reported) {
+		if (budget_used(event, now) >= event->run_budget) {
+			event->run_reported = true;
+			over = true;
+			miss = (struct k_deadline_miss){
+				.kind = K_DEADLINE_MISS_BUDGET,
+				.object = event,
+				.name = event->name,
+				.thread = event->consumer,
+				.release = event->run_start,
+				.deadline = (int)(event->run_start + event->run_budget),
+				.now = now,
+			};
+		} else {
+			budget_arm(event, now);
+		}
+	}
+	z_sched_spinlock_unlock(key);
+	if (over) {
+		z_deadline_miss_report(&miss);
+	}
+}
+
+void z_deadline_budget_switched_out(void)
+{
+	struct k_deadline_event *event = budget_run(_current);
+
+	if (event != NULL) {
+		event->run_out_at = k_cycle_get_32();
+	}
+}
+
+void z_deadline_budget_switched_in(void)
+{
+	struct k_deadline_event *event = budget_run(_current);
+
+	if (event != NULL && !event->run_reported) {
+		uint32_t now = k_cycle_get_32();
+
+		event->run_preempted += now - event->run_out_at;
+		budget_arm(event, now);
+	}
+}
+#endif
+
 void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now, uint32_t budget)
 {
 	if (event->budget != 0U) {
 		event->run_start = now;
 		event->run_budget = budget;
 		event->admission_state = ADMIT_RUNNING;
+#ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
+		event->run_preempted = 0U;
+		event->run_irq_mark = irq_time;
+		event->run_reported = false;
+		budget_arm(event, now);
+#endif
 	}
 }
 
@@ -826,6 +932,9 @@ void z_deadline_admission_finished(struct k_deadline_event *event)
 {
 	if (event->budget != 0U) {
 		event->admission_state = event->pending ? ADMIT_PENDING : ADMIT_IDLE;
+#ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
+		(void)z_try_abort_timeout(&budget_timeout);
+#endif
 	}
 }
 
@@ -1163,6 +1272,8 @@ void z_deadline_irq_exit(void)
 
 	if (depth > 0U) {
 		irq_nest[depth - 1U].nested += elapsed;
+	} else {
+		irq_time += elapsed;
 	}
 	if (res != NULL && elapsed - irq_nest[depth].nested > res->isr_budget) {
 		irq_report(res, now);

@@ -74,6 +74,12 @@ static inline void z_deadline_admission_report(const struct admission_verdict *v
 }
 #endif
 
+#ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
+/* At every context switch (CONFIG_INSTRUMENT_THREAD_SWITCHING): the run in progress's time. */
+void z_deadline_budget_switched_out(void);
+void z_deadline_budget_switched_in(void);
+#endif
+
 #ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
 /* Around an interrupt handler (arch interrupt entry): arrival and handler checks. */
 void z_deadline_irq_enter(int32_t irq);

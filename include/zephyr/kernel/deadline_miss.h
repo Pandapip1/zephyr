@@ -43,6 +43,11 @@ enum k_deadline_miss_kind {
 	 * after the previous activation. The activation is refused.
 	 */
 	K_DEADLINE_MISS_OVERRUN,
+	/**
+	 * A run went past its budget: its own execution time, time preempted and
+	 * interrupt handling excluded (CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE).
+	 */
+	K_DEADLINE_MISS_BUDGET,
 };
 
 /** One job run recorded for a report. */

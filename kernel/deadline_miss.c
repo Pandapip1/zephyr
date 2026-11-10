@@ -95,6 +95,8 @@ static const char *kind_name(enum k_deadline_miss_kind kind)
 		return "unsat";
 	case K_DEADLINE_MISS_OVERRUN:
 		return "activation outside its arrival model";
+	case K_DEADLINE_MISS_BUDGET:
+		return "run past its budget";
 	default:
 		return "?";
 	}

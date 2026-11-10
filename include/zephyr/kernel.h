@@ -1203,6 +1203,13 @@ struct k_deadline_event {
 	bool future;
 	/* Capacity reserved while armed (k_deadline_event_arm()), or NULL. */
 	struct k_deadline_reservation *reservation;
+#ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
+	/* The run in progress: time switched out, when it last was, interrupt time at its start. */
+	uint32_t run_preempted;
+	uint32_t run_out_at;
+	uint32_t run_irq_mark;
+	bool run_reported;
+#endif
 #endif
 #ifdef CONFIG_SCHED_DEADLINE_STATS
 	/* Longest run and longest release-to-start latency seen, cycles. */
