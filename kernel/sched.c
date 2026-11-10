@@ -231,8 +231,13 @@ static inline void ready_thread(struct k_thread *thread)
 	if (!z_is_thread_queued(thread) && z_is_thread_ready(thread)) {
 		SYS_PORT_TRACING_OBJ_FUNC(k_thread, sched_ready, thread);
 #ifdef CONFIG_SCHED_DEADLINE_JOBS
-		/* A job woken from a blocking call: the wake is its next release. */
-		z_deadline_job_ready(thread);
+		/*
+		 * A job woken from a blocking call: the wake is its next release, or is
+		 * held until its spacing allows one.
+		 */
+		if (z_deadline_job_ready(thread)) {
+			return;
+		}
 #endif
 
 		queue_thread(thread);
@@ -584,9 +589,10 @@ int z_pend_curr(struct k_spinlock *lock, k_spinlock_key_t key,
 #ifdef CONFIG_SCHED_DEADLINE_JOBS
 	/*
 	 * A wait on a kernel object (a mutex, a semaphore, a queue, a device's completion) is a
-	 * resource wait: the run continues. Only a sleep ends it (deadline_admission.c).
+	 * resource wait: the run continues. Only a sleep, or a bound thread's wait for its
+	 * releasing event (k_deadline_job_bind()), ends it (deadline_admission.c).
 	 */
-	_current->base.job_resource_wait = true;
+	_current->base.job_resource_wait = ((const void *)wait_q != _current->base.job_release_wq);
 #endif
 	pend_locked(_current, wait_q, timeout);
 	k_spin_release(lock);

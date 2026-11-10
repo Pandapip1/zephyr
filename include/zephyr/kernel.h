@@ -1230,6 +1230,8 @@ struct k_deadline_event {
 	bool woken;
 	/* That wake is the call's timeout, due at wake_due. */
 	bool wake_timed;
+	/* A bound thread's wake held until its spacing allows the release. */
+	bool held;
 	uint32_t wake_due;
 	/* A report found under a lock, made when the consumer resumes. */
 	uint8_t report;
@@ -1557,6 +1559,39 @@ int k_deadline_event_resume(struct k_deadline_event *event);
  * @retval -EPERM @p next would let a non-pausable job pause.
  */
 int k_deadline_event_change(struct k_deadline_event *event, struct k_deadline_reservation *next);
+
+/**
+ * @brief Make a thread that waits on a kernel object an armed job.
+ *
+ * For a thread whose loop blocks on one kernel object for its work (a work
+ * queue's notification, a FIFO, a semaphore): @p event becomes its job, armed
+ * with @p reservation (as k_deadline_event_arm()). Each wake from @p release_wait
+ * is a release of the job and each wait on it ends a run; its other waits are
+ * resource waits, inside a run. A wake sooner than the reservation's
+ * inter-arrival after the last release is held until it, not reported.
+ * CONFIG_SCHED_DEADLINE_JOBS.
+ *
+ * @param thread The thread.
+ * @param event Its deadline event, with no other consumer.
+ * @param reservation Its model, owned by the caller while armed.
+ * @param release_wait The wait queue of the object it waits on for work.
+ *
+ * @retval 0 Bound and armed.
+ * @retval -ETIME Infeasible; reported as K_DEADLINE_MISS_UNSAT. The thread is bound, unarmed.
+ * @retval -EINVAL The event has another consumer, or a model that cannot hold.
+ */
+int k_deadline_job_bind(struct k_thread *thread, struct k_deadline_event *event,
+			struct k_deadline_reservation *reservation, const void *release_wait);
+
+struct k_work_q;
+
+/**
+ * @brief Make a work queue's thread an armed job released by work submissions.
+ *
+ * k_deadline_job_bind() for @p queue's thread, released by its notifications.
+ */
+int k_work_queue_job_bind(struct k_work_q *queue, struct k_deadline_event *event,
+			  struct k_deadline_reservation *reservation);
 
 /**
  * @brief Reserve capacity for an interrupt line.

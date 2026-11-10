@@ -95,6 +95,8 @@ struct _thread_base {
 	struct k_deadline_event *job;
 	/* Blocked on a kernel object: its run continues, not ended by the wait. */
 	bool job_resource_wait;
+	/* For a bound thread (k_deadline_job_bind()): the wait that ends a run. */
+	const void *job_release_wq;
 #endif
 
 #if defined(CONFIG_SCHED_SCALABLE) || defined(CONFIG_WAITQ_SCALABLE)

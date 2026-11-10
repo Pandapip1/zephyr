@@ -45,3 +45,11 @@ static int long_wq_init(void)
 }
 
 SYS_INIT(long_wq_init, POST_KERNEL, CONFIG_BT_LONG_WQ_INIT_PRIO);
+
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+/* The queue, for its owner to declare as a job (k_work_queue_job_bind()). */
+struct k_work_q *bt_long_wq_get(void)
+{
+	return &bt_long_wq;
+}
+#endif

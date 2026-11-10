@@ -276,4 +276,85 @@ ZTEST(deadline_jobs, test_timer_expires_as_its_job)
 	zassert_equal_ptr(seen_in_expiry, &job_event);
 }
 
+/* A work queue bound as a job: each submission that wakes it is a release. */
+static K_THREAD_STACK_DEFINE(wq_stack, STACK_SIZE);
+static struct k_work_q bound_wq;
+static K_DEADLINE_EVENT_DEFINE(wq_event);
+static struct k_deadline_reservation wq_reservation;
+static volatile uint32_t wq_ran_at[3];
+static volatile int wq_runs;
+
+static void wq_item(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (wq_runs < (int)ARRAY_SIZE(wq_ran_at)) {
+		wq_ran_at[wq_runs] = k_cycle_get_32();
+	}
+	wq_runs++;
+}
+
+static K_WORK_DEFINE(wq_work, wq_item);
+
+/* Submissions within the declared spacing are held to it, not reported. */
+ZTEST(deadline_jobs, test_bound_work_queue_spaced_by_its_declaration)
+{
+	static bool started;
+
+	if (!started) {
+		k_work_queue_start(&bound_wq, wq_stack, STACK_SIZE, PRIO_JOB, NULL);
+		k_msleep(1);
+		wq_reservation = (struct k_deadline_reservation){
+			.budget = US(200U),
+			.min_interarrival = US(3000U),
+			.deadline = US(1000U),
+		};
+		zassert_ok(k_work_queue_job_bind(&bound_wq, &wq_event, &wq_reservation));
+		started = true;
+	}
+	wq_runs = 0;
+	k_work_submit_to_queue(&bound_wq, &wq_work);
+	k_msleep(1);
+	k_work_submit_to_queue(&bound_wq, &wq_work);
+	k_msleep(10);
+	zassert_equal(wq_runs, 2, "the submissions did not both run");
+	zassert_true((int32_t)(wq_ran_at[1] - wq_ran_at[0]) >= (int32_t)US(3000U) - (int32_t)US(100U),
+		     "a submission inside the spacing was not held: %d cycles apart",
+		     (int32_t)(wq_ran_at[1] - wq_ran_at[0]));
+	zassert_equal(reports, 0, "a held submission was reported");
+}
+
+/* A thread with no job never delays an admitted job: lower priority, it is preempted. */
+static volatile uint32_t unadmitted_slept;
+
+static void unadmitted_body(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+	for (;;) {
+		k_busy_wait(2000U);
+		k_sleep(K_USEC(100));
+		unadmitted_slept++;
+	}
+}
+
+ZTEST(deadline_jobs, test_unadmitted_timed_call_never_delays_a_job)
+{
+	static struct k_thread unadmitted;
+	static K_THREAD_STACK_DEFINE(unadmitted_stack, STACK_SIZE);
+
+	arm(5000U, 300U);
+	mode = MODE_SLEEP;
+	sleep_us = 10000U;
+	k_thread_create(&unadmitted, unadmitted_stack, STACK_SIZE, unadmitted_body, NULL, NULL,
+			NULL, PRIO_JOB + 2, 0, K_NO_WAIT);
+	k_deadline_event_post(&job_event, 0);
+	k_msleep(40);
+	k_thread_abort(&unadmitted);
+	zassert_true(unadmitted_slept > 0, "the unadmitted thread did not run");
+	zassert_true(wakes >= 1);
+	zassert_equal(reports, 0, "the job was delayed or reported");
+	zassert_true(unowned_reports > 0, "the unadmitted thread's timed calls were not reported");
+}
+
 ZTEST_SUITE(deadline_jobs, NULL, setup, before, NULL, NULL);

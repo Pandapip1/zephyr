@@ -1037,6 +1037,22 @@ static int hci_driver_open(const struct device *dev)
 	return 0;
 }
 
+#if defined(CONFIG_SCHED_DEADLINE_JOBS) && defined(CONFIG_BT_CTLR_RX_PRIO_STACK_SIZE) && \
+	!defined(CONFIG_BT_HCI_ACL_FLOW_CONTROL)
+/*
+ * The receive threads and the objects each waits on for work, for their owner to declare
+ * as jobs (k_deadline_job_bind()).
+ */
+void bt_ctlr_recv_threads_get(struct k_thread **prio, const void **prio_wait,
+			      struct k_thread **recv, const void **recv_wait)
+{
+	*prio = &prio_recv_thread_data;
+	*prio_wait = &sem_recv.wait_q;
+	*recv = &recv_thread_data;
+	*recv_wait = &recv_fifo._queue.wait_q;
+}
+#endif
+
 static int hci_driver_close(const struct device *dev)
 {
 	int err;

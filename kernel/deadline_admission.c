@@ -1369,6 +1369,8 @@ void z_deadline_admission_reset(struct k_deadline_event *event)
 #ifdef CONFIG_SCHED_DEADLINE_JOBS
 static bool timed_arm_locked(struct k_deadline_reservation *res);
 static void timed_cancel_locked(struct k_deadline_reservation *res);
+static int arm(struct k_deadline_event *event, struct k_deadline_reservation *res, bool periodic,
+	       uint32_t first);
 
 /*
  * Jobs. A thread runs its job from the wait that starts a run until it waits
@@ -1411,6 +1413,28 @@ struct k_deadline_job_probe {
 };
 struct k_deadline_job_probe z_deadline_job_probe[16];
 uint32_t z_deadline_job_unowned_count;
+
+/* Per bound job: runs, longest run and longest release-to-start, cycles, for reading. */
+struct k_deadline_job_runs {
+	const struct k_deadline_event *event;
+	uint32_t runs;
+	uint32_t max_run;
+	uint32_t max_latency;
+};
+struct k_deadline_job_runs z_deadline_job_runs[8];
+
+static struct k_deadline_job_runs *job_runs(const struct k_deadline_event *event)
+{
+	for (size_t i = 0U; i < ARRAY_SIZE(z_deadline_job_runs); i++) {
+		struct k_deadline_job_runs *r = &z_deadline_job_runs[i];
+
+		if (r->event == event || r->event == NULL) {
+			r->event = event;
+			return r;
+		}
+	}
+	return NULL;
+}
 #endif
 
 /* An undeclared call found under a lock: reported at the next resume point. */
@@ -1466,6 +1490,14 @@ void z_deadline_job_block(struct k_thread *thread)
 	if (thread != _current || job == NULL || !job->in_run || thread->base.job_resource_wait) {
 		return;
 	}
+#ifdef CONFIG_SCHED_DEADLINE_JOBS_PROBE
+	struct k_deadline_job_runs *r = job_runs(job);
+
+	if (r != NULL && job->reservation != NULL) {
+		r->runs++;
+		r->max_run = MAX(r->max_run, k_cycle_get_32() - job->run_start);
+	}
+#endif
 	if (job->reservation != NULL) {
 		z_deadline_admission_finished(job);
 	} else {
@@ -1493,21 +1525,59 @@ void z_deadline_job_timeout(struct k_thread *thread)
 	}
 }
 
-void z_deadline_job_ready(struct k_thread *thread)
+/* A held wake's spacing has elapsed: the thread is released now. */
+static void job_hold_expired(struct _timeout *timeout)
+{
+	struct k_thread *thread = CONTAINER_OF(timeout, struct k_thread, base.timeout);
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	if (thread->base.job != NULL && thread->base.job->held) {
+		thread->base.job->held = false;
+		z_mark_thread_as_not_suspended(thread);
+		z_sched_ready_locked(thread);
+	}
+	z_sched_spinlock_unlock(key);
+}
+
+bool z_deadline_job_ready(struct k_thread *thread)
 {
 	struct k_deadline_event *job = thread->base.job;
 	struct k_deadline_reservation *res;
 	uint32_t now;
 	uint32_t release;
 
-	if (job == NULL || !job->blocked) {
-		return;
+	if (job == NULL || !job->blocked || job->held) {
+		return false;
 	}
-	job->blocked = false;
-	job->woken = true;
 	now = k_cycle_get_32();
 	release = job->wake_timed ? job->wake_due : now;
 	res = job->reservation;
+	if (res != NULL && thread->base.job_release_wq != NULL && res->released &&
+	    (int32_t)(release - (res->last_release + res->min_interarrival)) < 0) {
+		/*
+		 * A bound thread's event came within its spacing of its last release:
+		 * held, not reported, until the spacing ends (as a resume is).
+		 */
+		uint32_t at = res->last_release + res->min_interarrival;
+		struct k_deadline_event *saved = job_expiring;
+		uint32_t saved_nest = job_expiring_nest;
+
+		job->held = true;
+		job->wake_timed = true;
+		job->wake_due = at;
+		z_mark_thread_as_suspended(thread);
+		/* The hold's timeout is the job's own. */
+		z_deadline_job_expiry(job);
+		(void)z_add_timeout(&thread->base.timeout, job_hold_expired,
+				    K_TIMEOUT_ABS_TICKS(sys_clock_tick_get() +
+						       (k_ticks_t)k_cyc_to_ticks_ceil64(
+							       (uint64_t)(at - now))));
+		job_expiring = saved;
+		job_expiring_nest = saved_nest;
+		return true;
+	}
+	job->blocked = false;
+	job->woken = true;
 	job->release = release;
 	job->released_idle = true;
 	if (res == NULL) {
@@ -1517,7 +1587,7 @@ void z_deadline_job_ready(struct k_thread *thread)
 		 */
 		job->report = IS_ENABLED(CONFIG_SCHED_DEADLINE_JOBS_STRICT) ?
 			      K_DEADLINE_MISS_UNDECLARED : 0U;
-		return;
+		return false;
 	}
 	change_apply(res);
 	if (res->released && (int32_t)(release - (res->last_release + res->min_interarrival)) < 0) {
@@ -1534,6 +1604,38 @@ void z_deadline_job_ready(struct k_thread *thread)
 		res->next_release = release + res->min_interarrival;
 		res->scheduled = timed_arm_locked(res);
 	}
+	return false;
+}
+
+int k_deadline_job_bind(struct k_thread *thread, struct k_deadline_event *event,
+			struct k_deadline_reservation *reservation, const void *release_wait)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	if (event->consumer != NULL && event->consumer != thread) {
+		z_sched_spinlock_unlock(key);
+		return -EINVAL;
+	}
+	event->consumer = thread;
+	thread->base.job = event;
+	thread->base.job_release_wq = release_wait;
+	/* Waiting for work now: its next wake is a release. Otherwise it is in a run. */
+	if (release_wait != NULL && (const void *)thread->base.pended_on == release_wait) {
+		event->in_run = false;
+		event->blocked = true;
+		event->wake_timed = false;
+	} else {
+		event->in_run = true;
+	}
+	z_sched_spinlock_unlock(key);
+	return arm(event, reservation, false, 0U);
+}
+
+int k_work_queue_job_bind(struct k_work_q *queue, struct k_deadline_event *event,
+			  struct k_deadline_reservation *reservation)
+{
+	return k_deadline_job_bind(k_work_queue_thread_get(queue), event, reservation,
+				   &queue->notifyq);
 }
 
 static void job_report(enum k_deadline_miss_kind kind, struct k_deadline_event *job,
@@ -1575,6 +1677,13 @@ void z_deadline_job_resumed(void)
 		job->report = 0U;
 		if (job->reservation != NULL) {
 			late = (int32_t)(now - (uint32_t)job->deadline) > 0;
+#ifdef CONFIG_SCHED_DEADLINE_JOBS_PROBE
+			struct k_deadline_job_runs *r = job_runs(job);
+
+			if (r != NULL) {
+				r->max_latency = MAX(r->max_latency, now - job->release);
+			}
+#endif
 			z_deadline_admission_started(job, now, job->pending_budget);
 		} else {
 			job->in_run = true;

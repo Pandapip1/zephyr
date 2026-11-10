@@ -5610,6 +5610,19 @@ static int bt_tx_processor_init(void)
 	return 0;
 }
 
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+/* The host's queues, for their owner to declare as jobs (k_work_queue_job_bind()). */
+struct k_work_q *bt_tx_processor_workq_get(void)
+{
+	return &bt_tx_processor_workq;
+}
+
+struct k_work_q *bt_rx_workq_get(void)
+{
+	return &bt_workq;
+}
+#endif
+
 /* Priority 999 is the last to run in POST_KERNEL. We don't actually
  * care when it runs, so long as it's before APPLICATION, when
  * `bt_enable()` can be called. Running it last will allow more urgent

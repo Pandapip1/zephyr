@@ -101,7 +101,7 @@ void z_deadline_budget_switched_in(void);
 struct k_deadline_event *z_deadline_current_job(void);
 void z_deadline_job_block(struct k_thread *thread);
 void z_deadline_job_timeout(struct k_thread *thread);
-void z_deadline_job_ready(struct k_thread *thread);
+bool z_deadline_job_ready(struct k_thread *thread);
 void z_deadline_job_resumed(void);
 /* A kernel timeout armed with no job behind it. Timeout lock held. */
 void z_deadline_job_unowned(const struct _timeout *to);
