@@ -1491,6 +1491,19 @@ struct k_deadline_admission_probe {
 extern struct k_deadline_admission_probe z_deadline_admission_probe;
 #endif
 
+#if defined(CONFIG_SCHED_DEADLINE_IRQ_PROBE) || defined(__DOXYGEN__)
+/** Per interrupt line: longest handler (nested excluded), shortest gap, arrivals; cycles. */
+struct k_deadline_irq_probe {
+	uint32_t max_handler;
+	uint32_t min_gap;
+	uint32_t count;
+	uint32_t last;
+};
+
+/** Measurement builds: one entry per interrupt line. */
+extern struct k_deadline_irq_probe z_deadline_irq_probe[CONFIG_NUM_IRQS];
+#endif
+
 #if defined(CONFIG_SCHED_DEADLINE_STATS) || defined(__DOXYGEN__)
 /**
  * @brief Longest run and release-to-start latency of @p event since boot.

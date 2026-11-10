@@ -245,6 +245,16 @@ config SCHED_DEADLINE_IRQ_BUDGETS
 	  than its budget, is reported as K_DEADLINE_MISS_OVERRUN. Direct
 	  interrupts bypass the common entry and are not checked.
 
+config SCHED_DEADLINE_IRQ_PROBE
+	bool "Record every interrupt line's longest handler and shortest gap"
+	depends on SCHED_DEADLINE_IRQ_BUDGETS
+	help
+	  Keep, per interrupt line, the longest handler run (nested handlers
+	  excluded), the shortest time between two arrivals and the number of
+	  arrivals, in z_deadline_irq_probe, for reading over a debugger: the
+	  measurements a line's reservation is declared from. Measurement
+	  builds only (12 bytes per line).
+
 config SCHED_DEADLINE_IRQ_STRICT
 	bool "Report interrupts of unreserved lines"
 	depends on SCHED_DEADLINE_IRQ_BUDGETS

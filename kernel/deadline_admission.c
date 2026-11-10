@@ -1584,8 +1584,27 @@ static struct {
 	uint32_t start;
 	uint32_t nested;
 	struct k_deadline_reservation *res;
+	int16_t irq;
 } irq_nest[IRQ_NEST_MAX];
 static uint8_t irq_depth;
+
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_PROBE
+struct k_deadline_irq_probe z_deadline_irq_probe[CONFIG_NUM_IRQS];
+/* Largest step back of k_cycle_get_32() between consecutive reads here, and where. */
+uint32_t z_deadline_clock_backstep[3];
+
+static void clock_monotonic(uint32_t now, uint32_t where)
+{
+	static uint32_t last;
+
+	if ((int32_t)(now - last) < 0 && last - now > z_deadline_clock_backstep[0]) {
+		z_deadline_clock_backstep[0] = last - now;
+		z_deadline_clock_backstep[1] = where;
+		z_deadline_clock_backstep[2] = now;
+	}
+	last = now;
+}
+#endif
 
 static void irq_report(const struct k_deadline_reservation *res, uint32_t now)
 {
@@ -1600,46 +1619,90 @@ static void irq_report(const struct k_deadline_reservation *res, uint32_t now)
 	z_deadline_miss_report(&miss);
 }
 
+/*
+ * The time is read and the nesting frame updated under one lock: a handler
+ * nesting between the two would otherwise take the same frame, or be counted
+ * in both its own and its parent's time. Reports are made after the lock.
+ */
 void z_deadline_irq_enter(int32_t irq)
 {
+	unsigned int key = arch_irq_lock();
 	uint32_t now = k_cycle_get_32();
 	struct k_deadline_reservation *res = irq_reservation(irq);
+	bool report = false;
+
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_PROBE
+	clock_monotonic(now, 0x10000U | (uint32_t)irq);
+#endif
 
 	if (res != NULL) {
-		if (res->released && now - res->last_release < res->min_interarrival) {
-			irq_report(res, now);
-		}
+		report = res->released && now - res->last_release < res->min_interarrival;
 		res->released = true;
 		res->last_release = now;
-	} else if (IS_ENABLED(CONFIG_SCHED_DEADLINE_IRQ_STRICT)) {
+	} else {
 		/* A line no admission check counts. */
-		irq_report(NULL, now);
+		report = IS_ENABLED(CONFIG_SCHED_DEADLINE_IRQ_STRICT);
 	}
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_PROBE
+	if (irq >= 0 && irq < CONFIG_NUM_IRQS) {
+		struct k_deadline_irq_probe *p = &z_deadline_irq_probe[irq];
+
+		if (p->count != 0U) {
+			p->min_gap = MIN(p->min_gap, now - p->last);
+		} else {
+			p->min_gap = UINT32_MAX;
+		}
+		p->last = now;
+		p->count++;
+	}
+#endif
 	if (irq_depth < IRQ_NEST_MAX) {
 		irq_nest[irq_depth].start = now;
 		irq_nest[irq_depth].nested = 0U;
 		irq_nest[irq_depth].res = res;
+		irq_nest[irq_depth].irq = (int16_t)irq;
 	}
 	irq_depth++;
+	arch_irq_unlock(key);
+	if (report) {
+		irq_report(res, now);
+	}
 }
 
 void z_deadline_irq_exit(void)
 {
+	unsigned int key = arch_irq_lock();
 	uint32_t now = k_cycle_get_32();
 	uint8_t depth = --irq_depth;
+	struct k_deadline_reservation *res = NULL;
+	bool report = false;
 
-	if (depth >= IRQ_NEST_MAX) {
-		return;
-	}
-	uint32_t elapsed = now - irq_nest[depth].start;
-	struct k_deadline_reservation *res = irq_nest[depth].res;
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_PROBE
+	clock_monotonic(now, 0x20000U | ((depth < IRQ_NEST_MAX) ? (uint32_t)irq_nest[depth].irq
+								 : 0xffffU));
+#endif
+	if (depth < IRQ_NEST_MAX) {
+		uint32_t elapsed = now - irq_nest[depth].start;
+		uint32_t own = elapsed - irq_nest[depth].nested;
 
-	if (depth > 0U) {
-		irq_nest[depth - 1U].nested += elapsed;
-	} else {
-		irq_time += elapsed;
+		res = irq_nest[depth].res;
+		if (depth > 0U) {
+			irq_nest[depth - 1U].nested += elapsed;
+		} else {
+			irq_time += elapsed;
+		}
+#ifdef CONFIG_SCHED_DEADLINE_IRQ_PROBE
+		int16_t irq = irq_nest[depth].irq;
+
+		if (irq >= 0 && irq < CONFIG_NUM_IRQS) {
+			z_deadline_irq_probe[irq].max_handler =
+				MAX(z_deadline_irq_probe[irq].max_handler, own);
+		}
+#endif
+		report = res != NULL && own > res->isr_budget;
 	}
-	if (res != NULL && elapsed - irq_nest[depth].nested > res->isr_budget) {
+	arch_irq_unlock(key);
+	if (report) {
 		irq_report(res, now);
 	}
 }
