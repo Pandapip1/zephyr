@@ -382,7 +382,9 @@ config CLOCK_EVENT_SCHED_SYNC_CHECK
 	  cycles of the active provider; logical time never steps back. A
 	  failure is reported to k_clock_sync_fault_handler() as
 	  K_DEADLINE_MISS_CLOCK_SYNC, not through the per-job miss path,
-	  which measures with the clocks that just failed.
+	  which measures with the clocks that just failed. Each provider
+	  delivers a check of its own, so either one stopping is caught: two
+	  of CLOCK_EVENT_SCHED_CLIENTS.
 
 config CLOCK_EVENT_SCHED_SYNC_DRIFT_PPM
 	int "Largest relative drift of the two providers (ppm)"

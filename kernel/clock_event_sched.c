@@ -50,12 +50,20 @@ enum sched_stage {
 	STAGE_ACTIVE,
 };
 
+enum sched_pin {
+	PIN_NONE,
+	PIN_DEEP,
+	PIN_ACTIVE,
+};
+
 struct sched_client {
 	struct k_clock_event *event;
 	uint64_t deadline;
 	uint64_t wake_at;
 	uint32_t generation;
 	enum sched_stage stage;
+	/* The provider that alone delivers it (the clock self-checks), or none. */
+	enum sched_pin pin;
 };
 
 /* A logical time and the provider count at the same instant. */
@@ -630,6 +638,42 @@ static void arm_asap_locked(void)
 }
 
 /*
+ * Keep a deep compare armed, however far out the deep provider accepts it: while an
+ * earlier write synchronizes, it keeps a target no earlier than that write's match. The
+ * deep expiry runs the clock self-check, which must not wait on the active provider.
+ * Caller holds sched_lock.
+ */
+static void deep_backstop_locked(void)
+{
+	for (uint32_t lead = deep_min + 1U; lead < BIT(30); lead *= 2U) {
+		if (hw_arm(&deep_hw, provider_now(deep_provider) + lead, &deep_armed.target,
+			   &deep_armed.armed) == 0) {
+			return;
+		}
+	}
+}
+
+/*
+ * Wait for logical time @p target, closer than the active provider can arm from @p now.
+ * The deep provider times the wait too: logical time that stalls past it is a clock fault,
+ * not a wait. Caller holds sched_lock.
+ */
+static void spin_active_locked(uint64_t target, uint64_t now)
+{
+	uint32_t d0 = provider_now(deep_provider);
+	uint32_t window = (uint32_t)convert_ceil(target - now, LOGICAL_HZ, deep_hz) + 2U;
+
+	while (now_locked() < target) {
+		if (IS_ENABLED(CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK) &&
+		    provider_now(deep_provider) - d0 > window) {
+			sync_fault(K_CLOCK_SYNC_DRIFT, target - now,
+				   scale_apply(deep_scale, provider_now(deep_provider) - d0));
+			break;
+		}
+	}
+}
+
+/*
  * Advance every client whose target has passed, then program each provider
  * with its earliest remaining target. With @p out, due clients are appended to
  * it for delivery once sched_lock is released. Without it (an arm or cancel,
@@ -645,6 +689,8 @@ static size_t service_locked(struct fired *out)
 		uint64_t now = now_locked();
 		struct sched_client *deep_next = NULL;
 		struct sched_client *active_next = NULL;
+		/* An active client, but the active-pinned self-check, keeps the active clock on. */
+		bool needs_active = false;
 		bool due_pending = false;
 
 		ARRAY_FOR_EACH_PTR(clients, c) {
@@ -663,7 +709,10 @@ static size_t service_locked(struct fired *out)
 					continue;
 				}
 				c->stage = STAGE_IDLE;
-				check_lateness(c, now, was);
+				/* A pinned client's deadline is a cadence, not checked. */
+				if (c->pin == PIN_NONE) {
+					check_lateness(c, now, was);
+				}
 				out[n++] = (struct fired){c->event, c->generation};
 				trace('F', c, now, c->deadline);
 			}
@@ -673,6 +722,9 @@ static size_t service_locked(struct fired *out)
 			} else if (c->stage == STAGE_ACTIVE &&
 				   (active_next == NULL || c->deadline < active_next->deadline)) {
 				active_next = c;
+			}
+			if (c->stage == STAGE_ACTIVE && c->pin != PIN_ACTIVE) {
+				needs_active = true;
 			}
 		}
 		if (due_pending) {
@@ -706,27 +758,40 @@ static size_t service_locked(struct fired *out)
 					active_for = deep_next;
 					active_target = retry;
 				}
+				if (IS_ENABLED(CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK)) {
+					/* The active provider may be the clock that failed. */
+					deep_backstop_locked();
+				}
 			} else if (ret == -EBUSY) {
 				/* Nothing else can wake it: retry, bounded by the deep lead. */
 				continue;
 			} else if (ret != 0) {
-				/* Inside the deep floor: hand it to the active provider. */
-				if (active_bound) {
+				/*
+				 * Inside the deep floor. A deep-only client stays on the deep
+				 * provider, at its first edge that can be armed: it must not
+				 * depend on the active provider (the clock self-check's).
+				 */
+				if (deep_next->pin == PIN_DEEP) {
+					deep_backstop_locked();
+				} else if (active_bound) {
 					deep_next->stage = STAGE_ACTIVE;
 					continue;
-				}
-				if (out == NULL) {
+				} else if (out == NULL) {
 					arm_asap_locked();
 					return n;
+				} else {
+					/*
+					 * Without one, the deadline is closer than any provider
+					 * can arm.
+					 */
+					while (now_locked() < deep_next->deadline) {
+					}
+					continue;
 				}
-				/* Without one, the deadline is closer than any provider can arm. */
-				while (now_locked() < deep_next->deadline) {
-				}
-				continue;
 			}
 		}
 
-		pm_lock_set(active_next != NULL || deep_deferred);
+		pm_lock_set(needs_active || deep_deferred);
 		if (active_for == NULL) {
 			if (active_bound) {
 				hw_cancel(&active_hw, &active_armed.armed);
@@ -738,8 +803,7 @@ static size_t service_locked(struct fired *out)
 				return n;
 			}
 			/* Closer than the active provider's lead: wait it out, never early. */
-			while (now_locked() < active_target) {
-			}
+			spin_active_locked(active_target, now);
 			continue;
 		}
 		return n;
@@ -787,7 +851,7 @@ static int sched_arm_abs(void *context, uint32_t deadline, uint32_t generation)
 	K_SPINLOCK(&sched_lock) {
 		uint64_t now = now_locked();
 		/* Without an active provider there is nothing to hand off to. */
-		uint64_t wake = active_bound ? wake_budget : 0U;
+		uint64_t wake = (active_bound && c->pin == PIN_NONE) ? wake_budget : 0U;
 
 		c->deadline = extend(deadline, now);
 		c->generation = generation;
@@ -797,7 +861,10 @@ static int sched_arm_abs(void *context, uint32_t deadline, uint32_t generation)
 			ret = -ETIME;
 			K_SPINLOCK_BREAK;
 		}
-		if (!active_bound || c->deadline - now >= deep_floor + wake) {
+		if (active_bound && c->pin == PIN_ACTIVE) {
+			c->stage = STAGE_ACTIVE;
+		} else if (!active_bound || c->pin == PIN_DEEP ||
+			   c->deadline - now >= deep_floor + wake) {
 			c->stage = STAGE_DEEP;
 			c->wake_at = c->deadline - wake;
 		} else {
@@ -911,6 +978,14 @@ static void select_locked(void)
 			anchor_locked(true);
 			on_active = true;
 			active_bound = true;
+			/* Active-pinned clients armed before it came move to it. */
+			ARRAY_FOR_EACH_PTR(clients, c) {
+				if (c->pin == PIN_ACTIVE && c->stage == STAGE_DEEP) {
+					c->stage = STAGE_ACTIVE;
+					c->wake_at = c->deadline;
+				}
+			}
+			(void)service_locked(NULL);
 		}
 	}
 }
@@ -995,20 +1070,20 @@ int k_clock_event_sched_init(struct k_clock_event *event, k_clock_event_handler_
 
 #ifdef CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK
 /*
- * The checks' own client: while the active provider runs, a check at least every
- * interval, delivered by the deep provider (its lead is far past the deep floor), so a
- * stopped active provider is caught even when nothing else would wake the CPU. One
- * scheduler clock client.
+ * The checks' own clients: while the active provider runs, a check at least every
+ * interval delivered by each provider alone, so that either one stopping is caught even
+ * when nothing else would wake the CPU. Two scheduler clock clients.
  */
-static struct k_clock_event sync_ce;
-static bool sync_ce_bound;
+static const enum sched_pin sync_pins[] = {PIN_DEEP, PIN_ACTIVE};
+static struct k_clock_event sync_ce[ARRAY_SIZE(sync_pins)];
+static bool sync_ce_bound[ARRAY_SIZE(sync_pins)];
 
-static void sync_ce_arm(void)
+static void sync_ce_arm(size_t i)
 {
 	uint64_t interval = (uint64_t)LOGICAL_HZ * CONFIG_CLOCK_EVENT_SCHED_SYNC_INTERVAL_MS / 1000U;
 
-	if (sync_ce_bound) {
-		(void)k_clock_event_arm_abs(&sync_ce,
+	if (sync_ce_bound[i]) {
+		(void)k_clock_event_arm_abs(&sync_ce[i],
 					    (uint32_t)(k_clock_event_sched_now() + interval));
 	}
 }
@@ -1017,23 +1092,48 @@ static void sync_ce_expired(struct k_clock_event *event, uint32_t generation, vo
 {
 	ARG_UNUSED(event);
 	ARG_UNUSED(generation);
-	ARG_UNUSED(user_data);
 	K_SPINLOCK(&sched_lock) {
 		sync_check_locked();
 	}
-	sync_ce_arm();
+	sync_ce_arm((size_t)(uintptr_t)user_data);
+}
+
+static void sync_ce_arm_all(void)
+{
+	ARRAY_FOR_EACH(sync_ce, i) {
+		sync_ce_arm(i);
+	}
+}
+
+static void sync_ce_cancel_all(void)
+{
+	ARRAY_FOR_EACH(sync_ce, i) {
+		if (sync_ce_bound[i]) {
+			k_clock_event_cancel(&sync_ce[i]);
+		}
+	}
 }
 
 static int sync_ce_init(void)
 {
-	sync_ce_bound = k_clock_event_sched_init(&sync_ce, sync_ce_expired, NULL) == 0;
-	sync_ce_arm();
+	ARRAY_FOR_EACH(sync_ce, i) {
+		sync_ce_bound[i] = k_clock_event_sched_init(&sync_ce[i], sync_ce_expired,
+							    (void *)(uintptr_t)i) == 0;
+		if (sync_ce_bound[i]) {
+			((struct sched_client *)sync_ce[i].context)->pin = sync_pins[i];
+		}
+	}
+	sync_ce_arm_all();
 	return 0;
 }
 
 SYS_INIT(sync_ce_init, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 #else
-static inline void sync_ce_arm(void)
+static inline void sync_ce_arm_all(void)
+{
+}
+
+static inline void sync_ce_cancel_all(void)
 {
 }
 #endif
@@ -1048,12 +1148,8 @@ static void sched_pm_entry(enum pm_state state)
 	if (state == PM_STATE_RUNTIME_IDLE || !active_bound) {
 		return;
 	}
-#ifdef CONFIG_CLOCK_EVENT_SCHED_SYNC_CHECK
 	/* Only one clock runs from here: nothing to check it against, no wake to spend. */
-	if (sync_ce_bound) {
-		k_clock_event_cancel(&sync_ce);
-	}
-#endif
+	sync_ce_cancel_all();
 	K_SPINLOCK(&sched_lock) {
 		anchor_locked(true);
 		on_active = false;
@@ -1070,7 +1166,7 @@ static void sched_pm_exit(enum pm_state state)
 		anchor_locked(true);
 		on_active = true;
 	}
-	sync_ce_arm();
+	sync_ce_arm_all();
 }
 
 static struct pm_notifier sched_pm_notifier = {
