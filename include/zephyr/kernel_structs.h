@@ -381,6 +381,10 @@ struct _timeout {
 #endif
 #endif /* CONFIG_TIMEOUT_BACKEND_MINHEAP */
 	_timeout_func_t fn;
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	/* Job that armed it; its expiry runs as that job (NULL: none). */
+	struct k_deadline_event *owner;
+#endif
 };
 
 typedef void (*k_thread_timeslice_fn_t)(struct k_thread *thread, void *data);

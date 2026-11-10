@@ -90,6 +90,13 @@ struct _thread_base {
 	int prio_deadline;
 #endif /* CONFIG_SCHED_DEADLINE */
 
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	/* The deadline event this thread consumes: the job it runs. */
+	struct k_deadline_event *job;
+	/* Blocked on a kernel object: its run continues, not ended by the wait. */
+	bool job_resource_wait;
+#endif
+
 #if defined(CONFIG_SCHED_SCALABLE) || defined(CONFIG_WAITQ_SCALABLE)
 	uint32_t order_key;
 #endif

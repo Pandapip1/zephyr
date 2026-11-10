@@ -230,6 +230,10 @@ static inline void ready_thread(struct k_thread *thread)
 	 */
 	if (!z_is_thread_queued(thread) && z_is_thread_ready(thread)) {
 		SYS_PORT_TRACING_OBJ_FUNC(k_thread, sched_ready, thread);
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+		/* A job woken from a blocking call: the wake is its next release. */
+		z_deadline_job_ready(thread);
+#endif
 
 		queue_thread(thread);
 		update_cache(0);
@@ -360,7 +364,8 @@ void z_thread_halt(struct k_thread *thread, k_spinlock_key_t key,
 	} else {
 		halt_thread(thread, terminate ? _THREAD_DEAD : _THREAD_SUSPENDED, &key);
 		if ((thread == _current) && !arch_is_in_isr()) {
-			if (z_is_thread_essential(thread)) {
+			/* An essential thread may suspend itself (a deadline-event wait); not exit. */
+			if (terminate && z_is_thread_essential(thread)) {
 				z_sched_spinlock_unlock(key);
 				k_panic();
 				key = z_sched_spinlock_lock();
@@ -539,6 +544,9 @@ void z_thread_timeout(struct _timeout *timeout)
 		 * wait.
 		 */
 		if (!z_timeout_inflight_superseded(timeout)) {
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+			z_deadline_job_timeout(thread);
+#endif
 			z_sched_wake_thread_locked(thread);
 		}
 	}
@@ -573,9 +581,24 @@ int z_pend_curr(struct k_spinlock *lock, k_spinlock_key_t key,
 	 * held.
 	 */
 	(void) z_sched_spinlock_lock();
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	/*
+	 * A wait on a kernel object (a mutex, a semaphore, a queue, a device's completion) is a
+	 * resource wait: the run continues. Only a sleep ends it (deadline_admission.c).
+	 */
+	_current->base.job_resource_wait = true;
+#endif
 	pend_locked(_current, wait_q, timeout);
 	k_spin_release(lock);
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	int ret = z_swap_locked(key);
+
+	_current->base.job_resource_wait = false;
+	z_deadline_job_resumed();
+	return ret;
+#else
 	return z_swap_locked(key);
+#endif
 }
 
 struct k_thread *z_unpend1_no_timeout(_wait_q_t *wait_q)

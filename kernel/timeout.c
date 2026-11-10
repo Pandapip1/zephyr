@@ -15,6 +15,7 @@
 #include <zephyr/llext/symbol.h>
 
 #include <timeslicing.h>
+#include <deadline_admission.h>
 
 /* Absolute tick counter: ticks since boot. */
 static uint64_t curr_tick;
@@ -38,19 +39,8 @@ static uint32_t announce_remaining;
  */
 static int announcing_cpu = -1;
 
-/*
- * With CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB a thread announces, and a thread or
- * interrupt that preempts it is not at the tick edge: only the announcing
- * thread's own callbacks are.
- */
-static struct k_thread *announcing_thread;
-
 static inline bool this_cpu_announcing(void)
 {
-	if (IS_ENABLED(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB)) {
-		return announcing_cpu == CPU_ID && !arch_is_in_isr() &&
-		       announcing_thread == _current;
-	}
 	return announcing_cpu == CPU_ID;
 }
 
@@ -105,8 +95,7 @@ static uint32_t elapsed(void)
 		return 0U;
 	}
 	return sys_clock_elapsed() +
-	       ((IS_ENABLED(CONFIG_SMP) || IS_ENABLED(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB)) ?
-		announce_remaining : 0);
+	       (IS_ENABLED(CONFIG_SMP) ? announce_remaining : 0);
 }
 
 /*
@@ -199,11 +188,23 @@ k_ticks_t z_add_timeout(struct _timeout *to, _timeout_func_t fn, k_timeout_t tim
 
 	__ASSERT(z_is_inactive_timeout(to), "");
 	to->fn = fn;
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	/* A thread's own timeout belongs to its job; any other to the job arming it. */
+	to->owner = (fn == z_thread_timeout) ?
+		    CONTAINER_OF(to, struct k_thread, base.timeout)->base.job :
+		    z_deadline_current_job();
+#endif
 
 	K_SPINLOCK(&timeout_lock) {
 		uint32_t ticks_elapsed = 0;
 		bool has_elapsed = false;
 		k_ticks_t dticks;
+
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+		if (to->owner == NULL) {
+			z_deadline_job_unowned(to);
+		}
+#endif
 
 		if (Z_IS_TIMEOUT_RELATIVE(timeout)) {
 			ticks_elapsed = elapsed();
@@ -368,7 +369,6 @@ void sys_clock_announce_locked(uint32_t ticks, k_spinlock_key_t key)
 
 	announce_remaining = ticks;
 	announcing_cpu = CPU_ID;
-	announcing_thread = _current;
 
 #ifdef _TIMEOUT_BACKEND_OWNS_ANNOUNCE
 	/* The backend (timer wheel) runs the firing loop itself: its per-tick
@@ -411,7 +411,14 @@ void sys_clock_announce_locked(uint32_t ticks, k_spinlock_key_t key)
 			inflight_timeout = t;
 
 			k_spin_unlock(&timeout_lock, key);
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+			/* The expiry runs as the job that armed it. */
+			z_deadline_job_expiry(t->owner);
 			handler(t);
+			z_deadline_job_expiry(NULL);
+#else
+			handler(t);
+#endif
 			key = k_spin_lock(&timeout_lock);
 			inflight_timeout = NULL;
 		}

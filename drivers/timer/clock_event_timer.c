@@ -11,11 +11,6 @@
  * clock-event provider feeds system time. Kernel timeouts are one scheduler
  * clock-event client: the service, not this driver, decides which provider
  * delivers each one.
- *
- * With CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB the expiry only releases a deadline
- * job, which announces. From the release until that job has announced and
- * reprogrammed, only the job arms: one release is outstanding at a time. Each
- * timeout expires at its own tick; nothing spaces them.
  */
 
 #include <zephyr/drivers/timer/system_timer.h>
@@ -42,40 +37,11 @@ static struct k_clock_event timeout_event;
 /* Cycle count of the last announced tick boundary; under the system clock lock. */
 static uint64_t announced;
 
-#ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB
-BUILD_ASSERT(IS_ENABLED(CONFIG_TICKLESS_KERNEL), "the announcing job reprograms on announce");
-
-static void announce_job(void *a, void *b, void *c);
-
-K_THREAD_DEFINE(sys_clock_announce_thread, CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_STACK_SIZE,
-		announce_job, NULL, NULL, NULL, CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_PRIORITY, 0, 0);
-/* Bound to its consumer from the start, so that the job can arm before its first wait. */
-static struct k_deadline_event announce_event = {
-	.consumer = &_k_thread_obj_sys_clock_announce_thread,
-	.name = "sys_clock_announce",
-};
-/* Released and not yet reprogrammed by the job; under the system clock lock. */
-static bool released;
-
-static bool arm_allowed(void)
-{
-	return !released || (!k_is_in_isr() && k_current_get() == sys_clock_announce_thread);
-}
-#else
-static bool arm_allowed(void)
-{
-	return true;
-}
-#endif
-
 static void arm(uint64_t now, uint32_t ticks)
 {
 	uint64_t elapsed = (now - announced) / CYC_PER_TICK;
 	uint64_t deadline = announced + (elapsed + ticks) * CYC_PER_TICK;
 
-	if (!arm_allowed()) {
-		return;
-	}
 	/*
 	 * A tick boundary inside the service's minimum lead is refused, and so is
 	 * one the clock passes while the arm runs: the service reads the clock
@@ -90,49 +56,6 @@ static void arm(uint64_t now, uint32_t ticks)
 	}
 }
 
-#ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB
-static void timeout_expired(struct k_clock_event *event, uint32_t generation, void *user_data)
-{
-	k_spinlock_key_t key = sys_clock_lock();
-	uint32_t now = (uint32_t)k_clock_event_sched_now();
-
-	ARG_UNUSED(event);
-	ARG_UNUSED(generation);
-	ARG_UNUSED(user_data);
-	released = true;
-	sys_clock_unlock(key);
-	k_deadline_event_post(&announce_event,
-			      (int)(now + k_ns_to_cyc_ceil32(
-					  CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS)));
-}
-
-static void announce_job(void *a, void *b, void *c)
-{
-	ARG_UNUSED(a);
-	ARG_UNUSED(b);
-	ARG_UNUSED(c);
-
-	for (;;) {
-		k_spinlock_key_t key;
-		uint64_t now;
-		uint32_t ticks;
-
-		k_deadline_event_wait(&announce_event);
-		key = sys_clock_lock();
-		now = k_clock_event_sched_now();
-		ticks = (uint32_t)((now - announced) / CYC_PER_TICK);
-		announced += ticks * CYC_PER_TICK;
-		if (ticks == 0U) {
-			arm(now, 1U);
-		}
-		/* Announcing reprograms the next expiry. */
-		sys_clock_announce_locked(ticks, key);
-		key = sys_clock_lock();
-		released = false;
-		sys_clock_unlock(key);
-	}
-}
-#else
 static void timeout_expired(struct k_clock_event *event, uint32_t generation, void *user_data)
 {
 	k_spinlock_key_t key = sys_clock_lock();
@@ -149,7 +72,6 @@ static void timeout_expired(struct k_clock_event *event, uint32_t generation, vo
 	}
 	sys_clock_announce_locked(ticks, key);
 }
-#endif
 
 void sys_clock_set_timeout(uint32_t ticks, bool idle)
 {

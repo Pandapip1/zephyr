@@ -48,6 +48,12 @@ enum k_deadline_miss_kind {
 	 * interrupt handling excluded (CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE).
 	 */
 	K_DEADLINE_MISS_BUDGET,
+	/**
+	 * An undeclared claim (CONFIG_SCHED_DEADLINE_JOBS): a timed kernel call
+	 * with no current job (the object is NULL), or a blocking call by a job
+	 * whose declaration does not cover the wake (the object is the job).
+	 */
+	K_DEADLINE_MISS_UNDECLARED,
 };
 
 /** One job run recorded for a report. */

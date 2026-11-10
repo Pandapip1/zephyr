@@ -20,6 +20,7 @@
 #include <kthread.h>
 #include <kswap.h>
 #include <timeout_q.h>
+#include <deadline_admission.h>
 #include <zephyr/internal/syscall_handler.h>
 #include <zephyr/tracing/tracing.h>
 #include <zephyr/logging/log.h>
@@ -72,6 +73,9 @@ k_ticks_t z_impl_k_sleep_ticks(k_timeout_t timeout)
 	z_mark_thread_as_sleeping(_current);
 
 	(void)z_swap_locked(key);
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	z_deadline_job_resumed();
+#endif
 
 	/* There is no meaningful remainder to report for K_FOREVER: reaching
 	 * this point at all means a k_wakeup() cut the sleep short.

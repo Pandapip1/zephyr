@@ -1222,6 +1222,18 @@ struct k_deadline_event {
 	int future_deadline;
 	uint8_t admission_state;
 	bool future;
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	/* Its consumer is in a run (CONFIG_SCHED_DEADLINE_JOBS). */
+	bool in_run;
+	/* The run ended in a blocking call; the wake is a release, then its start. */
+	bool blocked;
+	bool woken;
+	/* That wake is the call's timeout, due at wake_due. */
+	bool wake_timed;
+	uint32_t wake_due;
+	/* A report found under a lock, made when the consumer resumes. */
+	uint8_t report;
+#endif
 	/* Capacity reserved while armed (k_deadline_event_arm()), or NULL. */
 	struct k_deadline_reservation *reservation;
 #ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE

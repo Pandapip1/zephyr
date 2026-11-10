@@ -1119,7 +1119,7 @@ ZTEST(deadline_admission, test_non_pausable_change_keeps_non_pausable)
 	zassert_equal(k_deadline_event_change(&events[JOB_HIGH2], &next), -EPERM);
 }
 
-#ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB
+#ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER
 static volatile uint32_t timer_fired[2];
 
 static void timer_expiry(struct k_timer *timer)
@@ -1128,8 +1128,8 @@ static void timer_expiry(struct k_timer *timer)
 }
 
 /*
- * Timeouts expire in the announcing job at their tick: one due shortly after another is served
- * on time, within its tick and the job's start-by, not spaced from the first.
+ * Timeouts expire at the clock-event interrupt at their tick: one due shortly after another is
+ * served on time, within its tick, not spaced from the first.
  */
 ZTEST(deadline_admission, test_close_timeouts_expire_on_time)
 {
@@ -1138,8 +1138,7 @@ ZTEST(deadline_admission, test_close_timeouts_expire_on_time)
 	uint32_t due[2];
 	uint32_t bound;
 
-	bound = k_ticks_to_cyc_ceil32(1) +
-		k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS) + US(50U);
+	bound = k_ticks_to_cyc_ceil32(1) + US(50U);
 	for (int i = 0; i < 2; i++) {
 		k_timer_init(&timers[i], timer_expiry, NULL);
 		k_timer_user_data_set(&timers[i], INT_TO_POINTER(i));

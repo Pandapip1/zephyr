@@ -1327,6 +1327,10 @@ void z_deadline_admission_decide(uint32_t now)
 
 void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now, uint32_t budget)
 {
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	event->in_run = true;
+	_current->base.job = event;
+#endif
 	if (event->budget != 0U) {
 		event->run_start = now;
 		event->run_budget = budget;
@@ -1343,6 +1347,9 @@ void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now, 
 
 void z_deadline_admission_finished(struct k_deadline_event *event)
 {
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	event->in_run = false;
+#endif
 	if (event->budget != 0U) {
 		event->admission_state = event->pending ? ADMIT_PENDING : ADMIT_IDLE;
 #ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
@@ -1358,6 +1365,227 @@ void z_deadline_admission_reset(struct k_deadline_event *event)
 		event->admission_state = ADMIT_IDLE;
 	}
 }
+
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+static bool timed_arm_locked(struct k_deadline_reservation *res);
+static void timed_cancel_locked(struct k_deadline_reservation *res);
+
+/*
+ * Jobs. A thread runs its job from the wait that starts a run until it waits
+ * again or blocks. A blocking call ends the run; the wake is the job's next
+ * release: at the call's timeout (the tick it expired at) or at the event that
+ * woke it, under the job's reservation, which gives its start-by and must
+ * allow its spacing. The run starts when the thread resumes. A kernel timeout
+ * records the job that armed it and expires as that job.
+ */
+/* The job a timeout handler runs as, and the interrupt nesting it runs at. */
+static struct k_deadline_event *job_expiring;
+static uint32_t job_expiring_nest;
+
+void z_deadline_job_expiry(struct k_deadline_event *owner)
+{
+	job_expiring = owner;
+	job_expiring_nest = _current_cpu->nested;
+}
+
+struct k_deadline_event *z_deadline_job_irq_enter(void)
+{
+	struct k_deadline_event *saved = job_expiring;
+
+	/* An interrupt runs as its own line, never as the job it interrupted. */
+	job_expiring = NULL;
+	return saved;
+}
+
+void z_deadline_job_irq_exit(struct k_deadline_event *saved)
+{
+	job_expiring = saved;
+}
+
+/* Undeclared timed calls seen: by arming thread and timeout handler, for reading. */
+struct k_deadline_job_probe {
+	const struct k_thread *thread;
+	const void *fn;
+	uint32_t count;
+};
+struct k_deadline_job_probe z_deadline_job_probe[16];
+uint32_t z_deadline_job_unowned_count;
+
+/* An undeclared call found under a lock: reported at the next resume point. */
+static struct {
+	struct k_thread *thread;
+	bool pending;
+} unowned_report;
+
+struct k_deadline_event *z_deadline_current_job(void)
+{
+	struct k_deadline_event *job;
+
+	if (job_expiring != NULL && _current_cpu->nested == job_expiring_nest) {
+		/* Not an interrupt nested in the handler: it does not inherit the job. */
+		return job_expiring;
+	}
+	if (arch_is_in_isr()) {
+		return NULL;
+	}
+	job = _current->base.job;
+	return (job != NULL && job->in_run) ? job : NULL;
+}
+
+void z_deadline_job_unowned(const struct _timeout *to)
+{
+	struct k_thread *thread = arch_is_in_isr() ? NULL : _current;
+
+	z_deadline_job_unowned_count++;
+	for (size_t i = 0U; i < ARRAY_SIZE(z_deadline_job_probe); i++) {
+		struct k_deadline_job_probe *p = &z_deadline_job_probe[i];
+
+		if (p->count == 0U || (p->thread == thread && p->fn == (const void *)to->fn)) {
+			p->thread = thread;
+			p->fn = (const void *)to->fn;
+			p->count++;
+			break;
+		}
+	}
+	if (IS_ENABLED(CONFIG_SCHED_DEADLINE_JOBS_STRICT) && !unowned_report.pending) {
+		unowned_report.thread = thread;
+		unowned_report.pending = true;
+	}
+}
+
+void z_deadline_job_block(struct k_thread *thread)
+{
+	struct k_deadline_event *job = thread->base.job;
+
+	if (thread != _current || job == NULL || !job->in_run || thread->base.job_resource_wait) {
+		return;
+	}
+	if (job->reservation != NULL) {
+		z_deadline_admission_finished(job);
+	} else {
+		/* Undeclared: its run is suspended here, not ended (reported at the wake). */
+		job->in_run = false;
+	}
+	job->blocked = true;
+	job->woken = false;
+	job->wake_timed = false;
+	if (job->reservation != NULL && job->reservation->periodic) {
+		/* Its next release is this call's wake, not the next period. */
+		timed_cancel_locked(job->reservation);
+		job->reservation->scheduled = false;
+	}
+}
+
+void z_deadline_job_timeout(struct k_thread *thread)
+{
+	struct k_deadline_event *job = thread->base.job;
+
+	if (job != NULL && job->blocked) {
+		job->wake_timed = true;
+		/* The expiry's tick: lateness of the announcement counts against the start-by. */
+		job->wake_due = (uint32_t)k_ticks_to_cyc_floor64(sys_clock_tick_get());
+	}
+}
+
+void z_deadline_job_ready(struct k_thread *thread)
+{
+	struct k_deadline_event *job = thread->base.job;
+	struct k_deadline_reservation *res;
+	uint32_t now;
+	uint32_t release;
+
+	if (job == NULL || !job->blocked) {
+		return;
+	}
+	job->blocked = false;
+	job->woken = true;
+	now = k_cycle_get_32();
+	release = job->wake_timed ? job->wake_due : now;
+	res = job->reservation;
+	job->release = release;
+	job->released_idle = true;
+	if (res == NULL) {
+		/*
+		 * No declaration covers a wake of this job: it resumes its run as it was,
+		 * unchecked, and is reported in strict mode.
+		 */
+		job->report = IS_ENABLED(CONFIG_SCHED_DEADLINE_JOBS_STRICT) ?
+			      K_DEADLINE_MISS_UNDECLARED : 0U;
+		return;
+	}
+	change_apply(res);
+	if (res->released && (int32_t)(release - (res->last_release + res->min_interarrival)) < 0) {
+		job->report = K_DEADLINE_MISS_OVERRUN;
+	}
+	res->released = true;
+	res->last_release = release;
+	job->deadline = (int)(release + res->deadline);
+	job->pending_budget = res->budget;
+	job->admission_state = ADMIT_PENDING;
+	thread->base.prio_deadline = job->deadline;
+	if (res->periodic && !res->paused) {
+		/* Periods run on from this release. */
+		res->next_release = release + res->min_interarrival;
+		res->scheduled = timed_arm_locked(res);
+	}
+}
+
+static void job_report(enum k_deadline_miss_kind kind, struct k_deadline_event *job,
+		       struct k_thread *thread, uint32_t now)
+{
+	struct k_deadline_miss miss = {
+		.kind = kind,
+		.object = job,
+		.name = (job != NULL) ? job->name : NULL,
+		.thread = thread,
+		.release = (job != NULL) ? job->release : now,
+		.deadline = (job != NULL) ? job->deadline : (int)now,
+		.now = now,
+		.running_at_release = thread,
+	};
+
+	z_deadline_miss_report(&miss);
+}
+
+void z_deadline_job_resumed(void)
+{
+	struct k_deadline_event *job = _current->base.job;
+	struct k_thread *unowned = NULL;
+	bool unowned_pending;
+	uint8_t report = 0U;
+	bool late = false;
+	uint32_t now;
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+
+	now = k_cycle_get_32();
+	unowned_pending = unowned_report.pending;
+	if (unowned_pending) {
+		unowned = unowned_report.thread;
+		unowned_report.pending = false;
+	}
+	if (job != NULL && job->woken) {
+		job->woken = false;
+		report = job->report;
+		job->report = 0U;
+		if (job->reservation != NULL) {
+			late = (int32_t)(now - (uint32_t)job->deadline) > 0;
+			z_deadline_admission_started(job, now, job->pending_budget);
+		} else {
+			job->in_run = true;
+		}
+	}
+	z_sched_spinlock_unlock(key);
+	if (unowned_pending) {
+		job_report(K_DEADLINE_MISS_UNDECLARED, NULL, unowned, now);
+	}
+	if (report != 0U) {
+		job_report((enum k_deadline_miss_kind)report, job, _current, now);
+	}
+	if (late) {
+		job_report(K_DEADLINE_MISS_START, job, _current, now);
+	}
+}
+#endif
 
 void z_deadline_admission_report(const struct admission_verdict *verdict)
 {
@@ -1683,6 +1911,9 @@ static int arm(struct k_deadline_event *event, struct k_deadline_reservation *re
 	if (event->consumer == NULL) {
 		/* A job may arm itself before its first wait. */
 		event->consumer = k_current_get();
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+		event->consumer->base.job = event;
+#endif
 	}
 	if (!model_holds(res->budget, res->min_interarrival, res->deadline, res->isr_budget)) {
 		return -EINVAL;
@@ -1702,9 +1933,6 @@ static int arm(struct k_deadline_event *event, struct k_deadline_reservation *re
 			/* Delivered at its time, or reported late past the service's tolerance. */
 			res->jitter = k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS);
 #endif
-		} else if (IS_ENABLED(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB)) {
-			/* A kernel timeout would add the announcing job's response. */
-			return -EINVAL;
 		} else {
 			/* Announced up to one tick after its time. */
 			res->jitter = k_ticks_to_cyc_ceil32(1);

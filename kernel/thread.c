@@ -1833,6 +1833,9 @@ int z_impl_k_thread_join(struct k_thread *thread, k_timeout_t timeout)
 
 		SYS_PORT_TRACING_OBJ_FUNC_BLOCKING(k_thread, join, thread, timeout);
 		ret = z_swap_locked(key);
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+		z_deadline_job_resumed();
+#endif
 		SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_thread, join, thread, timeout, ret);
 
 		return ret;

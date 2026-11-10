@@ -134,8 +134,16 @@ static inline void z_init_thread_timeout(struct _thread_base *thread_base)
 
 extern void z_thread_timeout(struct _timeout *timeout);
 
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+/* The current thread about to block: its job's run ends here (deadline_admission.c). */
+void z_deadline_job_block(struct k_thread *thread);
+#endif
+
 static inline k_ticks_t z_add_thread_timeout(struct k_thread *thread, k_timeout_t ticks)
 {
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	z_deadline_job_block(thread);
+#endif
 	return z_add_timeout(&thread->base.timeout, z_thread_timeout, ticks);
 }
 

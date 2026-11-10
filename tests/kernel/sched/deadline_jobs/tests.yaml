@@ -1,0 +1,9 @@
+tests:
+  kernel.scheduler.deadline_jobs:
+    tags: kernel
+    # Wake times are asserted against the timeline: native_sim, or a QEMU model under icount.
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+    integration_platforms:
+      - native_sim

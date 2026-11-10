@@ -286,6 +286,25 @@ config SCHED_DEADLINE_TIMED_JOBS
 	  client (CONFIG_CLOCK_EVENT_SCHED_CLIENTS). A timed job armed with
 	  none free is released by a kernel timeout instead.
 
+config SCHED_DEADLINE_JOBS
+	bool "Attribute timed kernel calls to the running job"
+	depends on SCHED_DEADLINE_ADMISSION && !SMP
+	help
+	  Track the job each thread runs: a deadline event's consumer is in a
+	  run from the wait that starts it until it waits again or blocks.
+	  A blocking call inside a run ends it: the wake is a new release of
+	  the job, timed (the timeout's time) or by the event, under its
+	  reservation, with its start-by and arrival model checked. Every
+	  kernel timeout records the job that armed it, and its expiry runs
+	  as that job. A timed call with no current job, or a blocking call
+	  by a job with no reservation to cover its wake, is undeclared:
+	  recorded in z_deadline_job_probe and, with
+	  SCHED_DEADLINE_JOBS_STRICT, reported as K_DEADLINE_MISS_UNDECLARED.
+
+config SCHED_DEADLINE_JOBS_STRICT
+	bool "Report undeclared timed calls"
+	depends on SCHED_DEADLINE_JOBS
+
 config SCHED_DEADLINE_STATS
 	bool "Record the longest run and start latency of each deadline event"
 	depends on SCHED_DEADLINE

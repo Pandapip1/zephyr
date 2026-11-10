@@ -17,7 +17,7 @@
 #include <zephyr/irq.h>
 #include <zephyr/pm/pm.h>
 #include <cmsis_core.h>
-#ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
+#if defined(CONFIG_SCHED_DEADLINE_IRQ_BUDGETS) || defined(CONFIG_SCHED_DEADLINE_JOBS)
 #include <deadline_admission.h>
 #endif
 
@@ -82,6 +82,9 @@ void _isr_wrapper(void)
 #ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
 	z_deadline_irq_enter(irq_number);
 #endif
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	struct k_deadline_event *job = z_deadline_job_irq_enter();
+#endif
 
 #if defined(CONFIG_GEN_SW_ISR_TABLE_ARRAY)
 	const struct _isr_table_entry *entry = &_sw_isr_table[irq_number];
@@ -97,6 +100,9 @@ void _isr_wrapper(void)
 	z_soc_irq_eoi(irq_number);
 #endif
 
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+	z_deadline_job_irq_exit(job);
+#endif
 #ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
 	z_deadline_irq_exit();
 #endif

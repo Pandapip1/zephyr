@@ -91,6 +91,27 @@ void z_deadline_budget_switched_out(void);
 void z_deadline_budget_switched_in(void);
 #endif
 
+#ifdef CONFIG_SCHED_DEADLINE_JOBS
+/*
+ * Jobs (kernel/deadline_admission.c): the running job, a run ending in a blocking call and
+ * the wake that releases the next, and the job a kernel timeout runs as. The scheduler lock
+ * is held by the callers of block, timeout and ready; resumed is called by the woken thread
+ * with no lock held.
+ */
+struct k_deadline_event *z_deadline_current_job(void);
+void z_deadline_job_block(struct k_thread *thread);
+void z_deadline_job_timeout(struct k_thread *thread);
+void z_deadline_job_ready(struct k_thread *thread);
+void z_deadline_job_resumed(void);
+/* A kernel timeout armed with no job behind it. Timeout lock held. */
+void z_deadline_job_unowned(const struct _timeout *to);
+/* Around a timeout's handler: the job it runs as (NULL after it). */
+void z_deadline_job_expiry(struct k_deadline_event *owner);
+/* Around an interrupt handler (arch interrupt entry): the job is saved, none, restored. */
+struct k_deadline_event *z_deadline_job_irq_enter(void);
+void z_deadline_job_irq_exit(struct k_deadline_event *saved);
+#endif
+
 #ifdef CONFIG_SCHED_DEADLINE_IRQ_BUDGETS
 /* Around an interrupt handler (arch interrupt entry): arrival and handler checks. */
 void z_deadline_irq_enter(int32_t irq);
