@@ -11,7 +11,8 @@
 #include <zephyr/kernel/deferred_release.h>
 #include <zephyr/ztest.h>
 
-#define STACK_SIZE (1024 + CONFIG_TEST_EXTRA_STACK_SIZE)
+/* The job threads only wait and busy-wait; the suite also runs on a 32 KiB part. */
+#define STACK_SIZE (640 + CONFIG_TEST_EXTRA_STACK_SIZE)
 
 /*
  * Time scale of the cases. Every time below is written for a target on which a
@@ -245,15 +246,17 @@ ZTEST(deadline_admission, test_feasible_release_is_admitted)
 }
 
 /*
- * An admitted job keeps its guarantee: a high-priority release whose work
- * leaves no room for an admitted low-priority one is the release that fails,
+ * An admitted job keeps its guarantee: a high-priority release that no order
+ * can fit beside an admitted low-priority one is the release that fails,
  * reported with the deadline and the demand of the job it would make late.
+ * The low job (400 us) must start by +300 us, the high one (500 us) by +100 us:
+ * either order starts the second one late.
  */
 ZTEST(deadline_admission, test_higher_priority_release_cannot_revoke_lower)
 {
-	static const struct release r[] = {{JOB_LOW, 300U}, {JOB_HIGH, 2000U}};
+	static const struct release r[] = {{JOB_LOW, 300U}, {JOB_HIGH, 100U}};
 
-	budget(JOB_LOW, 50U);
+	budget(JOB_LOW, 400U);
 	budget(JOB_HIGH, 500U);
 	release_in_irq(r, ARRAY_SIZE(r));
 	zassert_equal(misses, 1, "infeasibility was not reported at release");
@@ -990,13 +993,12 @@ ZTEST(deadline_admission, test_irq_reservation_is_interference)
 }
 
 /*
- * Fixed-priority admission refuses a set another order satisfies. Both released at +100 us: the
- * low job (100 us) must start by +400 us, the high one (500 us) by +5000 us. Fixed priority runs
- * the high job first and the low one starts at +600 us, late; the order low then high starts them
- * at +100 us and +200 us, both in time. Admission simulates fixed priority only, so it refuses the
- * high release although the set is satisfiable.
+ * A set fixed priority cannot meet but another order can is admitted. Both released at +100 us:
+ * the low job (100 us) must start by +400 us, the high one (500 us) by +5000 us. Fixed priority
+ * would start the low one at +600 us, late; the dispatch rule runs it first (+100 us), then the
+ * high one (+200 us).
  */
-ZTEST(deadline_admission, test_fixed_priority_refuses_a_satisfiable_set)
+ZTEST(deadline_admission, test_satisfiable_set_admitted_in_its_order)
 {
 	uint32_t now = k_cycle_get_32();
 
@@ -1004,11 +1006,109 @@ ZTEST(deadline_admission, test_fixed_priority_refuses_a_satisfiable_set)
 	budget(JOB_HIGH, 500U);
 	zassert_ok(k_deadline_event_admit(&events[JOB_LOW], now + US(100U), now + US(100U),
 					  (int)(now + US(400U))));
-	zassert_equal(k_deadline_event_admit(&events[JOB_HIGH], now + US(100U), now + US(100U),
-					     (int)(now + US(5000U))),
-		      -ETIME, "admission accepted a set fixed priority cannot meet");
+	zassert_ok(k_deadline_event_admit(&events[JOB_HIGH], now + US(100U), now + US(100U),
+					   (int)(now + US(5000U))),
+		   "a satisfiable set was refused");
+	zassert_equal(misses, 0);
 	k_deadline_event_admit_cancel(&events[JOB_LOW]);
 	k_deadline_event_admit_cancel(&events[JOB_HIGH]);
+}
+
+/* With room for both orders, the higher priority runs first. */
+ZTEST(deadline_admission, test_dispatch_higher_first_when_it_fits)
+{
+	static const struct release r[] = {{JOB_LOW, 5000U}, {JOB_HIGH, 5000U}};
+
+	budget(JOB_LOW, 100U);
+	budget(JOB_HIGH, 100U);
+	release_in_irq(r, ARRAY_SIZE(r));
+	sleep_ms(2U);
+	zassert_equal(runs[JOB_HIGH], 1);
+	zassert_equal(runs[JOB_LOW], 1);
+	zassert_true((int32_t)(started_at[JOB_LOW] - started_at[JOB_HIGH]) > 0,
+		     "the lower priority ran first without need");
+	zassert_equal(misses, 0);
+}
+
+/* The lower priority runs first only when the deadlines require it, and every deadline is met. */
+ZTEST(deadline_admission, test_dispatch_lower_first_only_when_required)
+{
+	static const struct release r[] = {{JOB_LOW, 300U}, {JOB_HIGH, 5000U}};
+
+	budget(JOB_LOW, 100U);
+	budget(JOB_HIGH, 500U);
+	release_in_irq(r, ARRAY_SIZE(r));
+	sleep_ms(3U);
+	zassert_equal(misses, 0, "a satisfiable set was refused or missed");
+	zassert_equal(runs[JOB_HIGH], 1);
+	zassert_equal(runs[JOB_LOW], 1);
+	zassert_true((int32_t)(started_at[JOB_HIGH] - started_at[JOB_LOW]) > 0,
+		     "the low job, which only meets its deadline first, did not run first");
+}
+
+/*
+ * A running job is never preempted by a lower priority: a low release whose deadline falls
+ * inside the running high job's run cannot be met, so it is refused, and the high run is not
+ * interrupted for it.
+ */
+static void post_low_tight(const void *param)
+{
+	ARG_UNUSED(param);
+	k_deadline_event_post(&events[JOB_LOW], (int)(k_cycle_get_32() + US(100U)));
+}
+
+static struct k_thread preemptee_thread;
+static K_THREAD_STACK_DEFINE(preemptee_stack, STACK_SIZE);
+static K_SEM_DEFINE(preemptee_armed, 0, 1);
+static struct k_deadline_event preemptee_event;
+static volatile uint32_t preemptee_end;
+
+static void preemptee(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+	k_sem_give(&preemptee_armed);
+	for (;;) {
+		k_deadline_event_wait(&preemptee_event);
+		k_busy_wait(300U * scale);
+		irq_offload(post_low_tight, NULL);
+		k_busy_wait(700U * scale);
+		preemptee_end = k_cycle_get_32();
+	}
+}
+
+ZTEST(deadline_admission, test_running_job_not_preempted_by_lower)
+{
+	k_deadline_event_init(&preemptee_event);
+	(void)k_thread_create(&preemptee_thread, preemptee_stack, STACK_SIZE, preemptee, NULL,
+			      NULL, NULL, PRIO_HIGH, 0, K_NO_WAIT);
+	k_sem_take(&preemptee_armed, K_FOREVER);
+	sleep_ms(1U);
+	k_deadline_event_budget_set(&preemptee_event, US(1100U));
+	budget(JOB_LOW, 50U);
+	k_deadline_event_post(&preemptee_event, (int)(k_cycle_get_32() + US(USEC_PER_SEC)));
+	sleep_ms(3U);
+	zassert_equal(misses, 1, "the low release was not refused");
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
+	zassert_equal_ptr(last_miss.object, &events[JOB_LOW]);
+	zassert_equal(runs[JOB_LOW], 0, "the refused low release ran, inside the high run");
+	k_deadline_event_budget_set(&preemptee_event, 0U);
+	k_thread_abort(&preemptee_thread);
+}
+
+/* Last (cases run in name order): the longest check and decision of the whole suite. */
+ZTEST(deadline_admission, test_zz_probe_report)
+{
+#ifdef CONFIG_SCHED_DEADLINE_ADMISSION_PROBE
+	TC_PRINT("probe: admission check longest %u cycles over %u, dispatch decision longest %u "
+		 "cycles over %u (%u Hz)\n",
+		 z_deadline_admission_probe.check_max, z_deadline_admission_probe.check_count,
+		 z_deadline_admission_probe.decide_max, z_deadline_admission_probe.decide_count,
+		 sys_clock_hw_cycles_per_sec());
+#else
+	ztest_test_skip();
+#endif
 }
 
 ZTEST_SUITE(deadline_admission, NULL, setup, before, after, NULL);

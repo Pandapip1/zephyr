@@ -200,6 +200,29 @@ config SCHED_DEADLINE_ADMISSION_BLOCKING_NS
 	  scheduler locked, and interrupt handling. Taken once at the start of
 	  every check.
 
+config SCHED_DEADLINE_DISPATCH
+	bool "Dispatch admitted jobs by priority among the satisfying orders"
+	depends on SCHED_DEADLINE_ADMISSION && !SMP
+	default y
+	help
+	  Between admitted deadline-event consumers, run the highest priority
+	  whose run keeps every admitted job able to start by its deadline
+	  (an EDF-slack guard), and a lower priority first only when every
+	  satisfying order needs it. A running job is never preempted by a
+	  lower one. Admission simulates the same rule, so it admits sets a
+	  fixed-priority order cannot meet but another order can. The
+	  decision is taken at releases, run starts and ends, arms and
+	  disarms, and read by the scheduler in constant time. Threads outside
+	  admission keep Zephyr's priority order.
+
+config SCHED_DEADLINE_ADMISSION_PROBE
+	bool "Record the longest admission check and dispatch decision"
+	depends on SCHED_DEADLINE_ADMISSION
+	help
+	  Keep, in z_deadline_admission_probe, the longest admission check and
+	  the longest dispatch decision (scheduler clock cycles) and how many of
+	  each ran, for reading over a debugger. Measurement builds only.
+
 config SCHED_DEADLINE_BUDGET_ENFORCE
 	bool "Enforce the budget of every admitted run"
 	depends on SCHED_DEADLINE_ADMISSION

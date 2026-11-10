@@ -1478,6 +1478,19 @@ int k_irq_reserve(unsigned int irq, struct k_deadline_reservation *reservation);
 void k_irq_unreserve(unsigned int irq);
 #endif
 
+#if defined(CONFIG_SCHED_DEADLINE_ADMISSION_PROBE) || defined(__DOXYGEN__)
+/** Longest admission check and dispatch decision so far, scheduler clock cycles, and counts. */
+struct k_deadline_admission_probe {
+	uint32_t check_max;
+	uint32_t check_count;
+	uint32_t decide_max;
+	uint32_t decide_count;
+};
+
+/** Measurement builds: read it over a debugger or from a test. */
+extern struct k_deadline_admission_probe z_deadline_admission_probe;
+#endif
+
 #if defined(CONFIG_SCHED_DEADLINE_STATS) || defined(__DOXYGEN__)
 /**
  * @brief Longest run and release-to-start latency of @p event since boot.

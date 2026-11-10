@@ -1,5 +1,12 @@
 tests:
   kernel.scheduler.deadline_budget:
     tags: kernel
+    # The cases assert when an overrun is detected: they need a deterministic timeline
+    # (native_sim, or a QEMU model under icount; see owo-open-fw
+    # tests/scheduler-deadline-qemu/run-budget-qemu.sh). QEMU boards that run on host time
+    # (mps2/an385, qemu_cortex_m3) can deliver timer interrupts late by host scheduling.
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
     integration_platforms:
       - native_sim

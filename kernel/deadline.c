@@ -104,7 +104,10 @@ static void deadline_event_post(struct k_deadline_event *event, bool has_not_bef
 	refused = !feasible && (verdict.victim == event);
 	if (refused) {
 		*event = before;
-	} else if (idle) {
+	}
+	/* Before the consumer is readied: readying it takes the scheduler's choice. */
+	z_deadline_admission_decide(now);
+	if (!refused && idle) {
 		/* Assign the EDF key before making the consumer observable as ready. */
 		thread->base.prio_deadline = event->deadline;
 		z_mark_thread_as_not_suspended(thread);

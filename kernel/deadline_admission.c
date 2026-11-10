@@ -113,6 +113,9 @@ struct sim {
 	int32_t seg_start[2U * CONFIG_SCHED_DEADLINE_ADMISSION_JOBS + 3U];
 	int32_t seg_end[2U * CONFIG_SCHED_DEADLINE_ADMISSION_JOBS + 3U];
 	int16_t seg_prio[2U * CONFIG_SCHED_DEADLINE_ADMISSION_JOBS + 3U];
+	/* The jobs by deadline (dispatch rule), set at the first step of a run. */
+	uint8_t order[CONFIG_SCHED_DEADLINE_ADMISSION_JOBS];
+	bool sorted;
 };
 
 /* Record that @p prio ran over [@p start, @p end), merged with a contiguous run of the same. */
@@ -152,14 +155,172 @@ static struct sim_job *sim_add(struct sim *s)
 	return &s->jobs[s->count++];
 }
 
-/* @p a runs before @p b when both are ready and neither is running. */
-static bool sim_before(const struct sim_job *a, const struct sim_job *b)
+/*
+ * The dispatch rule (docs/zephyr-dual-clock-scheduler.md, "Dispatch"): among
+ * the orders that start every job by its deadline, run the highest priority
+ * first; a lower priority goes first only when every such order needs it.
+ *
+ * Oracle: ordering by start-by deadline (EDF) starts every job in time if any
+ * order does, so the set stays satisfiable after running candidate h first iff
+ * h's cost fits the EDF slack of every job not yet started whose deadline is
+ * earlier than h's (those with later deadlines already count h's work):
+ *   S_k = d_k - t - sum of the costs of every other job with d_i <= d_k.
+ * Jobs not yet released count as released now, which can only refuse more.
+ */
+struct guard_job {
+	/* Deadline relative to now, and the CPU time the job still needs. */
+	int32_t deadline;
+	int32_t cost;
+	int16_t prio;
+	/* May be chosen now. */
+	bool candidate;
+	/* Has a start-by deadline still to meet. */
+	bool binding;
+};
+
+/* Sort @p order (indices of @p g) by deadline. Insertion sort: n <= 12, often presorted. */
+static __maybe_unused void guard_sort(const struct guard_job *g, uint8_t *order, size_t n)
 {
-	if (a->prio != b->prio) {
-		return a->prio < b->prio;
+	for (size_t i = 0U; i < n; i++) {
+		order[i] = (uint8_t)i;
 	}
-	return (int32_t)(a->deadline - b->deadline) < 0;
+	for (size_t i = 1U; i < n; i++) {
+		uint8_t x = order[i];
+		size_t j = i;
+
+		while (j > 0U && g[order[j - 1U]].deadline - g[x].deadline > 0) {
+			order[j] = order[j - 1U];
+			j--;
+		}
+		order[j] = x;
+	}
 }
+
+/*
+ * The job the rule runs now, or -1 when none is a candidate. @p order lists
+ * @p g by deadline; @p before is scratch of @p n entries. One sweep in
+ * deadline order gives every binding job's slack and, for every job, the
+ * least slack of the jobs with strictly earlier deadlines, which its cost
+ * must fit.
+ */
+static __maybe_unused int guard_choose(const struct guard_job *g, size_t n, const uint8_t *order,
+				       int32_t *before)
+{
+	int32_t sum = 0;
+	int32_t least = INT32_MAX;
+	int best = -1;
+	int edf = -1;
+
+	for (size_t i = 0U; i < n;) {
+		size_t end = i;
+		int32_t group = 0;
+		int32_t group_least = INT32_MAX;
+
+		/* A group of equal deadlines: each job counts the others of its group. */
+		while (end < n && g[order[end]].deadline == g[order[i]].deadline) {
+			group += g[order[end]].cost;
+			end++;
+		}
+		for (size_t k = i; k < end; k++) {
+			const struct guard_job *job = &g[order[k]];
+
+			before[order[k]] = least;
+			if (job->binding) {
+				group_least = MIN(group_least,
+						  job->deadline - (sum + group - job->cost));
+			}
+		}
+		least = MIN(least, group_least);
+		sum += group;
+		i = end;
+	}
+	for (size_t h = 0U; h < n; h++) {
+		if (!g[h].candidate) {
+			continue;
+		}
+		if (edf < 0 || g[h].deadline - g[edf].deadline < 0 ||
+		    (g[h].deadline == g[edf].deadline && g[h].prio < g[edf].prio)) {
+			edf = (int)h;
+		}
+		bool fits = g[h].cost <= before[h];
+
+		if (fits && (best < 0 || g[h].prio < g[best].prio ||
+			     (g[h].prio == g[best].prio &&
+			      g[h].deadline - g[best].deadline < 0))) {
+			best = (int)h;
+		}
+	}
+	/* No candidate keeps the set satisfiable first: the earliest deadline does if any can. */
+	return (best >= 0) ? best : edf;
+}
+
+/* Under the rule, @p c may take the CPU from @p cur, which is running. */
+static __maybe_unused bool sim_may_preempt(const struct sim_job *c, const struct sim_job *cur)
+{
+	if (c->prio != cur->prio) {
+		/* Never a lower priority over a running job. */
+		return c->prio < cur->prio;
+	}
+	return !cur->cooperative && c->deadline - cur->deadline < 0;
+}
+
+#ifndef CONFIG_SCHED_DEADLINE_DISPATCH
+/*
+ * Without the dispatch rule the scheduler is Zephyr's: the highest priority, the earliest
+ * deadline within one; a running cooperative job keeps the CPU against its own priority.
+ */
+static int sim_choose(const struct sim *s, int32_t t, int current)
+{
+	int best = -1;
+
+	for (size_t i = 0U; i < s->count; i++) {
+		const struct sim_job *j = &s->jobs[i];
+
+		if (j->res != NULL || j->remaining == 0U || j->release > t) {
+			continue;
+		}
+		if (best < 0 || j->prio < s->jobs[best].prio ||
+		    (j->prio == s->jobs[best].prio && j->deadline - s->jobs[best].deadline < 0)) {
+			best = (int)i;
+		}
+	}
+	if (current >= 0 && s->jobs[current].remaining != 0U && best >= 0 && best != current &&
+	    s->jobs[current].cooperative && s->jobs[best].prio >= s->jobs[current].prio) {
+		best = current;
+	}
+	return best;
+}
+#else
+/* The job the rule runs at @p t in the simulation, or -1. */
+static int sim_choose(struct sim *s, int32_t t, int current)
+{
+	static struct guard_job g[CONFIG_SCHED_DEADLINE_ADMISSION_JOBS];
+	static int32_t slack[CONFIG_SCHED_DEADLINE_ADMISSION_JOBS];
+	const struct sim_job *cur =
+		(current >= 0 && s->jobs[current].remaining != 0U) ? &s->jobs[current] : NULL;
+
+	for (size_t i = 0U; i < s->count; i++) {
+		const struct sim_job *j = &s->jobs[i];
+		int32_t spin = (!j->started && j->not_before > t) ? j->not_before - t : 0;
+
+		g[i] = (struct guard_job){
+			.deadline = j->deadline - t,
+			.cost = (j->res == NULL) ? (int32_t)j->remaining + spin : 0,
+			.prio = (int16_t)j->prio,
+			.candidate = j->res == NULL && j->remaining != 0U && j->release <= t &&
+				     (cur == NULL || j == cur || sim_may_preempt(j, cur)),
+			.binding = j->res == NULL && j->remaining != 0U && !j->started &&
+				   !j->ordering_only,
+		};
+	}
+	if (!s->sorted) {
+		/* Deadlines do not change during a check: one order for every step. */
+		guard_sort(g, s->order, s->count);
+		s->sorted = true;
+	}
+	return guard_choose(g, s->count, s->order, slack);
+}
+#endif
 
 /*
  * Run the scheduler's policy over the job set from time 0 and mark every job
@@ -172,33 +333,23 @@ static bool sim_run(struct sim *s)
 	bool ok = true;
 
 	s->segs = 0U;
+	s->sorted = false;
 	sim_segment(s, 0, s->blocking, INT16_MIN);
 
 	/* Each step finishes a job or reaches a release: bounded by twice the jobs. */
 	for (size_t step = 0U; step < 2U * ARRAY_SIZE(s->jobs) + 2U; step++) {
-		int best = -1;
 		int32_t next_release = INT32_MAX;
 
 		for (size_t i = 0U; i < s->count; i++) {
 			struct sim_job *j = &s->jobs[i];
 
-			if (j->remaining == 0U) {
-				continue;
-			}
-			if (j->release > t) {
+			if (j->remaining != 0U && j->release > t) {
 				next_release = MIN(next_release, j->release);
-				continue;
-			}
-			if (best < 0 || sim_before(j, &s->jobs[best])) {
-				best = (int)i;
 			}
 		}
-		/* A running cooperative job keeps the CPU against its own priority. */
-		if (current >= 0 && s->jobs[current].remaining != 0U && best >= 0 &&
-		    best != current && s->jobs[current].cooperative &&
-		    s->jobs[best].prio >= s->jobs[current].prio) {
-			best = current;
-		}
+
+		int best = sim_choose(s, t, current);
+
 		if (best < 0) {
 			if (next_release == INT32_MAX) {
 				break;
@@ -291,7 +442,8 @@ static uint32_t sim_blocker(const struct sim *s, const struct sim_job *a)
 			continue;
 		}
 		if (k->prio > a->prio) {
-			blocks = !preempts(a, k);
+			/* Or chosen first by the dispatch rule for its earlier deadline. */
+			blocks = !preempts(a, k) || k->deadline - a->deadline < 0;
 		} else if (k->prio == a->prio && a->cooperative && a->res == NULL && k->res == NULL) {
 			blocks = !k->running_at_check && k->release < a->release &&
 				 k->deadline - a->deadline > 0;
@@ -344,7 +496,8 @@ static uint64_t sim_released_ahead(const struct sim *s, const struct sim_job *a,
 		if (k->release <= from || k->release > to) {
 			continue;
 		}
-		if (k->prio < a->prio || (k->prio == a->prio && k->deadline - a->deadline <= 0)) {
+		if (k->prio < a->prio || k->deadline - a->deadline <= 0) {
+			/* Higher priority, or an earlier deadline the dispatch rule may run first. */
 			demand += k->work;
 		}
 	}
@@ -665,9 +818,9 @@ static uint32_t sim_demand(const struct sim *s, const struct sim_job *victim)
  * job it would make late. Only when the set is infeasible without the request
  * too (admitted work already cannot be met) is that work reported.
  */
-static bool admission_check(uint32_t now, const struct sim_job *extra,
-			    struct k_deadline_event *requester,
-			    struct admission_verdict *verdict)
+static bool admission_check_run(uint32_t now, const struct sim_job *extra,
+				struct k_deadline_event *requester,
+				struct admission_verdict *verdict)
 {
 	/* One check at a time: the simulation state is too large for small stacks. */
 	static struct sim s;
@@ -715,6 +868,27 @@ static bool admission_check(uint32_t now, const struct sim_job *extra,
 	verdict->deadline = (int)(now + (uint32_t)victim->deadline);
 	verdict->demand = sim_demand(&s, victim);
 	return false;
+}
+
+#ifdef CONFIG_SCHED_DEADLINE_ADMISSION_PROBE
+struct k_deadline_admission_probe z_deadline_admission_probe;
+#endif
+
+static bool admission_check(uint32_t now, const struct sim_job *extra,
+			    struct k_deadline_event *requester,
+			    struct admission_verdict *verdict)
+{
+#ifdef CONFIG_SCHED_DEADLINE_ADMISSION_PROBE
+	uint32_t start = k_cycle_get_32();
+	bool ok = admission_check_run(now, extra, requester, verdict);
+	uint32_t took = k_cycle_get_32() - start;
+
+	z_deadline_admission_probe.check_max = MAX(z_deadline_admission_probe.check_max, took);
+	z_deadline_admission_probe.check_count++;
+	return ok;
+#else
+	return admission_check_run(now, extra, requester, verdict);
+#endif
 }
 
 static void admission_report(const struct admission_verdict *verdict, struct k_thread *running)
@@ -970,6 +1144,135 @@ void z_deadline_budget_switched_in(void)
 }
 #endif
 
+#ifdef CONFIG_SCHED_DEADLINE_DISPATCH
+/*
+ * Runtime dispatch by the same rule as the simulation (guard_choose()). The
+ * decision is taken at the scheduling points, where the job set changes (a
+ * release, a run's start and end, an arm, a disarm), and cached: next_up()
+ * reads it in constant time. Between scheduling points nothing changes the
+ * set, and the guard assumes a chosen job runs its whole remaining budget.
+ */
+static struct k_thread *dispatch_choice;
+
+static void dispatch_decide_run(uint32_t now)
+{
+	static struct guard_job g[CONFIG_SCHED_DEADLINE_ADMISSION_JOBS];
+	static int32_t slack[CONFIG_SCHED_DEADLINE_ADMISSION_JOBS];
+	static struct k_thread *owner[CONFIG_SCHED_DEADLINE_ADMISSION_JOBS];
+	struct k_deadline_event *event;
+	struct k_deadline_event *cur = NULL;
+	size_t n = 0U;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&admitted, event, admission_node) {
+		if (event->consumer == _current && event->admission_state == ADMIT_RUNNING) {
+			cur = event;
+		}
+	}
+	SYS_SLIST_FOR_EACH_CONTAINER(&admitted, event, admission_node) {
+		struct k_thread *consumer = event->consumer;
+		bool running = event->admission_state == ADMIT_RUNNING;
+		bool pending = event->admission_state == ADMIT_PENDING;
+
+		if (consumer == NULL || n + 2U > ARRAY_SIZE(g)) {
+			continue;
+		}
+		if (running || pending) {
+			uint32_t used = (consumer == _current && running) ? now - event->run_start : 0U;
+			uint32_t budget = running ? event->run_budget : event->pending_budget;
+			int deadline = running ? consumer->base.prio_deadline : event->deadline;
+			bool may = cur == NULL || event == cur ||
+				   (consumer->base.prio != cur->consumer->base.prio ?
+					    consumer->base.prio < cur->consumer->base.prio :
+					    cur->consumer->base.prio >= 0 &&
+						    deadline - cur->consumer->base.prio_deadline < 0);
+
+			owner[n] = consumer;
+			g[n++] = (struct guard_job){
+				.deadline = (int32_t)((uint32_t)deadline - now),
+				.cost = (int32_t)((used < budget) ? budget - used : 0U),
+				.prio = (int16_t)consumer->base.prio,
+				/* Ready, running, or about to be readied by the release being recorded. */
+				.candidate = may && (z_is_thread_ready(consumer) || consumer == _current ||
+						     (pending && consumer->base.thread_state ==
+								 _THREAD_SUSPENDED)),
+				.binding = pending,
+			};
+		}
+		if (event->future || (event->reservation != NULL && !pending && !running)) {
+			/* Releases still to come, as if released now: binding, not runnable. */
+			bool armed = event->reservation != NULL;
+
+			owner[n] = NULL;
+			g[n++] = (struct guard_job){
+				.deadline = armed ? (int32_t)event->reservation->deadline
+						  : (int32_t)((uint32_t)event->future_deadline - now),
+				.cost = (int32_t)(armed ? event->reservation->budget : event->budget),
+				.prio = (int16_t)consumer->base.prio,
+				.binding = true,
+			};
+		}
+	}
+	static uint8_t order[CONFIG_SCHED_DEADLINE_ADMISSION_JOBS];
+
+	guard_sort(g, order, n);
+
+	int best = guard_choose(g, n, order, slack);
+
+	dispatch_choice = (best >= 0) ? owner[best] : NULL;
+}
+
+static void dispatch_decide(uint32_t now)
+{
+#ifdef CONFIG_SCHED_DEADLINE_ADMISSION_PROBE
+	uint32_t start = k_cycle_get_32();
+
+	dispatch_decide_run(now);
+
+	uint32_t took = k_cycle_get_32() - start;
+
+	z_deadline_admission_probe.decide_max = MAX(z_deadline_admission_probe.decide_max, took);
+	z_deadline_admission_probe.decide_count++;
+#else
+	dispatch_decide_run(now);
+#endif
+}
+
+/* An admitted consumer: the rule decides between these, Zephyr's priority between the rest. */
+static bool dispatch_admitted(const struct k_thread *thread)
+{
+	struct k_deadline_event *event;
+
+	SYS_SLIST_FOR_EACH_CONTAINER(&admitted, event, admission_node) {
+		if (event->consumer == thread && (event->admission_state == ADMIT_RUNNING ||
+						  event->admission_state == ADMIT_PENDING)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+struct k_thread *z_deadline_dispatch(struct k_thread *best)
+{
+	struct k_thread *choice = dispatch_choice;
+
+	if (choice == NULL || choice == best || best == NULL || !dispatch_admitted(best) ||
+	    !(z_is_thread_ready(choice) || choice == _current)) {
+		return best;
+	}
+	return choice;
+}
+#else
+static inline void dispatch_decide(uint32_t now)
+{
+	ARG_UNUSED(now);
+}
+#endif
+
+void z_deadline_admission_decide(uint32_t now)
+{
+	dispatch_decide(now);
+}
+
 void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now, uint32_t budget)
 {
 	if (event->budget != 0U) {
@@ -982,6 +1285,7 @@ void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now, 
 		event->run_reported = false;
 		budget_arm(event, now);
 #endif
+		dispatch_decide(now);
 	}
 }
 
@@ -992,6 +1296,7 @@ void z_deadline_admission_finished(struct k_deadline_event *event)
 #ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
 		budget_cancel();
 #endif
+		dispatch_decide(k_cycle_get_32());
 	}
 }
 
@@ -1149,6 +1454,7 @@ static int arm(struct k_deadline_event *event, struct k_deadline_reservation *re
 		res->event = event;
 		event->reservation = res;
 		sys_slist_append(&reservations, &res->node);
+		dispatch_decide(now);
 	} else {
 		event->budget = budget_before;
 		if (budget_before == 0U) {
@@ -1192,6 +1498,7 @@ void k_deadline_event_disarm(struct k_deadline_event *event)
 	if (res != NULL) {
 		(void)sys_slist_find_and_remove(&reservations, &res->node);
 		event->reservation = NULL;
+		dispatch_decide(k_cycle_get_32());
 	}
 	z_sched_spinlock_unlock(key);
 	if (res != NULL && res->periodic) {

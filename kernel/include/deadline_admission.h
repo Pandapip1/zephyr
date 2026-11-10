@@ -34,8 +34,14 @@ void z_deadline_admission_started(struct k_deadline_event *event, uint32_t now,
 				  uint32_t budget);
 void z_deadline_admission_finished(struct k_deadline_event *event);
 void z_deadline_admission_reset(struct k_deadline_event *event);
+/* After a release has been recorded and its consumer readied: take the dispatch decision. */
+void z_deadline_admission_decide(uint32_t now);
 void z_deadline_admission_report(const struct admission_verdict *verdict);
 #else
+static inline void z_deadline_admission_decide(uint32_t now)
+{
+	ARG_UNUSED(now);
+}
 static inline void z_deadline_admission_publication(const struct k_deadline_event *event,
 						    uint32_t now, int *deadline, uint32_t *budget)
 {
@@ -72,6 +78,11 @@ static inline void z_deadline_admission_report(const struct admission_verdict *v
 {
 	ARG_UNUSED(verdict);
 }
+#endif
+
+#ifdef CONFIG_SCHED_DEADLINE_DISPATCH
+/* next_up(): the thread the dispatch rule runs instead of @p best, or @p best. Scheduler lock held. */
+struct k_thread *z_deadline_dispatch(struct k_thread *best);
 #endif
 
 #ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE

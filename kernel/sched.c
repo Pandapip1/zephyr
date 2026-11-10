@@ -6,6 +6,7 @@
 #include <zephyr/kernel.h>
 #include <kspinlock.h>
 #include <ksched.h>
+#include <deadline_admission.h>
 #include <zephyr/spinlock.h>
 #include <wait_q.h>
 #include <kthread.h>
@@ -74,6 +75,9 @@ static ALWAYS_INLINE struct k_thread *next_up(void)
 	struct k_thread *thread = runq_best();
 
 	thread = metairq_preempt_recover(thread);
+#ifdef CONFIG_SCHED_DEADLINE_DISPATCH
+	thread = z_deadline_dispatch(thread);
+#endif
 
 #ifndef CONFIG_SMP
 	/* In uniprocessor mode, we can leave the current thread in
