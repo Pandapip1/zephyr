@@ -298,12 +298,21 @@ config SCHED_DEADLINE_JOBS
 	  kernel timeout records the job that armed it, and its expiry runs
 	  as that job. A timed call with no current job, or a blocking call
 	  by a job with no reservation to cover its wake, is undeclared:
-	  recorded in z_deadline_job_probe and, with
+	  recorded (SCHED_DEADLINE_JOBS_PROBE) and, with
 	  SCHED_DEADLINE_JOBS_STRICT, reported as K_DEADLINE_MISS_UNDECLARED.
 
 config SCHED_DEADLINE_JOBS_STRICT
 	bool "Report undeclared timed calls"
 	depends on SCHED_DEADLINE_JOBS
+
+config SCHED_DEADLINE_JOBS_PROBE
+	bool "Record undeclared timed calls by thread and handler"
+	depends on SCHED_DEADLINE_JOBS
+	help
+	  Keep, per arming thread and timeout handler, the count of timed
+	  calls made with no current job, in z_deadline_job_probe, for
+	  reading over a debugger: the inventory a declaration is made from.
+	  Measurement builds only (192 bytes).
 
 config SCHED_DEADLINE_STATS
 	bool "Record the longest run and start latency of each deadline event"

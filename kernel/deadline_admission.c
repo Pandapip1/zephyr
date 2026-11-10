@@ -1402,6 +1402,7 @@ void z_deadline_job_irq_exit(struct k_deadline_event *saved)
 	job_expiring = saved;
 }
 
+#ifdef CONFIG_SCHED_DEADLINE_JOBS_PROBE
 /* Undeclared timed calls seen: by arming thread and timeout handler, for reading. */
 struct k_deadline_job_probe {
 	const struct k_thread *thread;
@@ -1410,6 +1411,7 @@ struct k_deadline_job_probe {
 };
 struct k_deadline_job_probe z_deadline_job_probe[16];
 uint32_t z_deadline_job_unowned_count;
+#endif
 
 /* An undeclared call found under a lock: reported at the next resume point. */
 static struct {
@@ -1436,6 +1438,7 @@ void z_deadline_job_unowned(const struct _timeout *to)
 {
 	struct k_thread *thread = arch_is_in_isr() ? NULL : _current;
 
+#ifdef CONFIG_SCHED_DEADLINE_JOBS_PROBE
 	z_deadline_job_unowned_count++;
 	for (size_t i = 0U; i < ARRAY_SIZE(z_deadline_job_probe); i++) {
 		struct k_deadline_job_probe *p = &z_deadline_job_probe[i];
@@ -1447,6 +1450,9 @@ void z_deadline_job_unowned(const struct _timeout *to)
 			break;
 		}
 	}
+#else
+	ARG_UNUSED(to);
+#endif
 	if (IS_ENABLED(CONFIG_SCHED_DEADLINE_JOBS_STRICT) && !unowned_report.pending) {
 		unowned_report.thread = thread;
 		unowned_report.pending = true;
