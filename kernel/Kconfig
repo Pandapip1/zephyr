@@ -290,6 +290,7 @@ config CLOCK_EVENT_SCHED_FREQUENCY
 
 config CLOCK_EVENT_SCHED_CLIENTS
 	int "Scheduler clock-event clients"
+	default 5 if SCHED_DEADLINE_BUDGET_ENFORCE
 	default 4
 	range 1 32
 	help

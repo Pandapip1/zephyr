@@ -99,6 +99,20 @@ ZTEST(deadline_budget, test_run_past_budget_reported)
 		      last_miss.kind);
 	zassert_equal(last_miss.kind, K_DEADLINE_MISS_BUDGET);
 	zassert_equal_ptr(last_miss.object, &events[JOB_LOW]);
+	/*
+	 * Not preempted, so the run's own time is its wall time: the report comes within the
+	 * detection latency of the budget's end (deadline.c, budget enforcement).
+	 */
+	uint32_t late = last_miss.now - (uint32_t)last_miss.deadline;
+#if defined(CONFIG_CLOCK_EVENT_SCHED) && defined(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT_MIN_LEAD_NS)
+	/* The active provider's minimum lead, then its delivery tolerance. */
+	uint32_t bound = k_ns_to_cyc_ceil32(CONFIG_COUNTER_SILABS_TIMER_CLOCK_EVENT_MIN_LEAD_NS +
+					    CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS);
+#else
+	uint32_t bound = k_ticks_to_cyc_ceil32(2);
+#endif
+	TC_PRINT("budget overrun detected %u cycles after the budget (bound %u)\n", late, bound);
+	zassert_true(late <= bound, "detected %u cycles late, bound %u", late, bound);
 	k_deadline_event_budget_set(&events[JOB_LOW], 0U);
 }
 

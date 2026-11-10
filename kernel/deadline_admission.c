@@ -821,12 +821,24 @@ bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint
 #ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
 /*
  * Budget enforcement. A run's own time is its wall time less the time it
- * was switched out and the interrupt time while it ran. One timeout, armed
+ * was switched out and the interrupt time while it ran. One timer, armed
  * whenever a budgeted run is switched in, expires at its remaining budget;
  * a run then found past its budget is reported once. A run switched out
- * leaves the timeout armed: its expiry checks whatever runs then.
+ * leaves the timer armed: its expiry checks whatever runs then.
+ *
+ * The timer is a scheduler clock event when the service exists: it is
+ * delivered at its target on the active provider (at least that provider's
+ * minimum lead after it is armed), or reported itself as a late clock event
+ * past the target plus CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS. So an
+ * overrun is caught within budget + minimum lead + that tolerance. Without
+ * the service it is a kernel timeout, caught within budget + two ticks.
  */
+#ifdef CONFIG_CLOCK_EVENT_SCHED
+static struct k_clock_event budget_ce;
+static bool budget_ce_bound;
+#else
 static struct _timeout budget_timeout;
+#endif
 
 /* The budgeted run in progress on @p thread, or NULL. */
 static struct k_deadline_event *budget_run(struct k_thread *thread)
@@ -846,20 +858,66 @@ static uint32_t budget_used(const struct k_deadline_event *event, uint32_t now)
 	return (now - event->run_start) - event->run_preempted - (irq_time - event->run_irq_mark);
 }
 
-static void budget_expired(struct _timeout *timeout);
+static void budget_check(void);
+
+#ifdef CONFIG_CLOCK_EVENT_SCHED
+static void budget_ce_expired(struct k_clock_event *ce, uint32_t generation, void *user_data)
+{
+	ARG_UNUSED(ce);
+	ARG_UNUSED(generation);
+	ARG_UNUSED(user_data);
+	budget_check();
+}
+#else
+static void budget_timeout_expired(struct _timeout *timeout)
+{
+	ARG_UNUSED(timeout);
+	budget_check();
+}
+#endif
+
+static void budget_cancel(void)
+{
+#ifdef CONFIG_CLOCK_EVENT_SCHED
+	if (budget_ce_bound) {
+		k_clock_event_cancel(&budget_ce);
+	}
+#else
+	(void)z_try_abort_timeout(&budget_timeout);
+#endif
+}
 
 static void budget_arm(struct k_deadline_event *event, uint32_t now)
 {
 	uint32_t used = budget_used(event, now);
 	uint32_t left = (used < event->run_budget) ? event->run_budget - used : 0U;
 
+#ifdef CONFIG_CLOCK_EVENT_SCHED
+	if (!budget_ce_bound) {
+		budget_ce_bound = (k_clock_event_sched_init(&budget_ce, budget_ce_expired, NULL) == 0);
+		__ASSERT(budget_ce_bound, "no scheduler clock-event slot for budget enforcement");
+	}
+	/* Inside the provider's minimum lead, the check comes at that lead. */
+	uint32_t lead = k_clock_event_min_arm_cycles(&budget_ce);
+
+	for (int attempt = 0; attempt < 2; attempt++) {
+		if (k_clock_event_arm_abs(&budget_ce, now + MAX(left, lead)) == 0) {
+			return;
+		}
+		/* The lead passed while arming: retry from the current time. */
+		now = k_cycle_get_32();
+		left = 0U;
+	}
+	__ASSERT(false, "budget clock event could not be armed");
+#else
 	(void)z_try_abort_timeout(&budget_timeout);
 	/* A timeout never fires early; one more tick covers rounding to the tick. */
-	(void)z_add_timeout(&budget_timeout, budget_expired,
+	(void)z_add_timeout(&budget_timeout, budget_timeout_expired,
 			    Z_TIMEOUT_TICKS((k_ticks_t)k_cyc_to_ticks_ceil32(left) + 1));
+#endif
 }
 
-static void budget_expired(struct _timeout *timeout)
+static void budget_check(void)
 {
 	uint32_t now = k_cycle_get_32();
 	k_spinlock_key_t key = z_sched_spinlock_lock();
@@ -867,7 +925,6 @@ static void budget_expired(struct _timeout *timeout)
 	struct k_deadline_miss miss;
 	bool over = false;
 
-	ARG_UNUSED(timeout);
 	if (event != NULL && !event->run_reported) {
 		if (budget_used(event, now) >= event->run_budget) {
 			event->run_reported = true;
@@ -933,7 +990,7 @@ void z_deadline_admission_finished(struct k_deadline_event *event)
 	if (event->budget != 0U) {
 		event->admission_state = event->pending ? ADMIT_PENDING : ADMIT_IDLE;
 #ifdef CONFIG_SCHED_DEADLINE_BUDGET_ENFORCE
-		(void)z_try_abort_timeout(&budget_timeout);
+		budget_cancel();
 #endif
 	}
 }
