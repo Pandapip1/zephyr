@@ -1133,13 +1133,14 @@ struct k_deadline_event;
  * Armed with k_deadline_event_arm() (sporadic: released by
  * k_deadline_event_post() at any time, at most one instance outstanding and
  * no two releases closer than @ref min_interarrival) or
- * k_deadline_event_arm_periodic() (released by the kernel every @ref
- * min_interarrival). Admission proves, when it is armed, that every release
- * the model allows starts within @ref deadline whatever else is admitted, and
- * keeps proving it for every later request until k_deadline_event_disarm():
- * a release is never checked, and finishing a run never has to re-admit.
+ * k_deadline_event_arm_periodic() (timed: released by the kernel every @ref
+ * min_interarrival, or at a later time the job chooses). Admission proves,
+ * when it is armed, that every release the model allows starts within @ref
+ * deadline whatever else is admitted, and keeps proving it for every later
+ * request until k_deadline_event_disarm(): a release is never checked, and
+ * finishing a run never has to re-admit.
  *
- * Set the first four fields before arming; the rest are internal.
+ * Set the first five fields before arming; the rest are internal.
  */
 struct k_deadline_reservation {
 	/** Worst-case execution time of one run, in @ref k_cycle_get_32 units. */
@@ -1153,6 +1154,8 @@ struct k_deadline_reservation {
 	 * interrupt level: interference on all thread work, once per release.
 	 */
 	uint32_t isr_budget;
+	/** A timed job that k_deadline_event_pause() refuses to pause. */
+	bool non_pausable;
 	/** @cond INTERNAL_HIDDEN */
 	sys_snode_t node;
 	struct k_deadline_event *event;
@@ -1160,9 +1163,27 @@ struct k_deadline_reservation {
 	uint32_t jitter;
 	bool released;
 	bool periodic;
+	/* The model admission charges: this one, or its envelope with a pending change. */
+	uint32_t adm_budget;
+	uint32_t adm_min_interarrival;
+	uint32_t adm_deadline;
+	uint32_t adm_isr_budget;
+	/* Declaration replacing this one at the next release (k_deadline_event_change()). */
+	struct {
+		uint32_t budget;
+		uint32_t min_interarrival;
+		uint32_t deadline;
+		uint32_t isr_budget;
+		bool non_pausable;
+		bool pending;
+	} change;
+	/* Timed releases: the next one, whether it is on the timer, paused. */
+	uint32_t next_release;
+	bool scheduled;
+	bool paused;
+	/* Release timer: a scheduler clock event of the kernel's pool, or a kernel timeout. */
+	int8_t timer;
 	struct _timeout timeout;
-	k_ticks_t next_tick;
-	k_ticks_t period_ticks;
 	/* Interrupt line of k_irq_reserve(), or -1. */
 	int32_t irq;
 	/** @endcond */
@@ -1406,7 +1427,7 @@ int k_deadline_demand_admit(int prio, uint32_t cycles);
  * returns it to armed without a check. A release outside the model is refused
  * and reported as K_DEADLINE_MISS_OVERRUN.
  *
- * @param event Deadline event; its consumer must already wait on it.
+ * @param event Deadline event; its consumer must already wait on it, or be the caller.
  * @param reservation Model of its releases, owned by the caller while armed.
  *
  * @retval 0 Armed.
@@ -1420,13 +1441,18 @@ int k_deadline_event_arm(struct k_deadline_event *event,
  * @brief Arm a periodic recurring job: the kernel releases it every period.
  *
  * As k_deadline_event_arm(), with @c reservation->min_interarrival the period
- * (a whole number of kernel ticks) and the first release @p first. The kernel
- * releases the run every period from then on; the next release is scheduled
- * when one is made, never when a run finishes, so it cannot fail. A release
- * that finds the previous run still outstanding is reported as
- * K_DEADLINE_MISS_OVERRUN and dropped.
+ * and the first release @p first. The kernel releases the run every period
+ * from then on, on a scheduler clock event of its own
+ * (CONFIG_SCHED_DEADLINE_TIMED_JOBS of them; without the scheduler clock
+ * service, a kernel timeout and a period of whole ticks), with the start-by
+ * deadline counted from the release time, not from its delivery. The next
+ * release is scheduled when one is made, never when a run finishes, so it
+ * cannot fail. A release that finds the previous run still outstanding is
+ * reported as K_DEADLINE_MISS_OVERRUN and dropped. See also
+ * k_deadline_event_release_at(), k_deadline_event_pause() and
+ * k_deadline_event_resume().
  *
- * @param event Deadline event; its consumer must already wait on it.
+ * @param event Deadline event; its consumer must already wait on it, or be the caller.
  * @param reservation Model of its releases, owned by the caller while armed.
  * @param first First release, in @ref k_cycle_get_32 units.
  *
@@ -1446,6 +1472,79 @@ int k_deadline_event_arm_periodic(struct k_deadline_event *event,
  * @param event Deadline event.
  */
 void k_deadline_event_disarm(struct k_deadline_event *event);
+
+/**
+ * @brief Choose the next release of a timed job.
+ *
+ * For a job armed with k_deadline_event_arm_periodic(): its next release is
+ * @p at instead of one period after the last, or one period after the last if
+ * @p at is sooner. A release the model already allows, so it cannot fail.
+ *
+ * @isr_ok
+ *
+ * @param event Deadline event of a timed job.
+ * @param at Release time, in @ref k_cycle_get_32 units.
+ *
+ * @retval 0 Scheduled.
+ * @retval -EINVAL Not a timed job.
+ */
+int k_deadline_event_release_at(struct k_deadline_event *event, uint32_t at);
+
+/**
+ * @brief Pause a timed job: no more releases, its capacity still reserved.
+ *
+ * Admission keeps charging the job at its declared rate, as for an armed
+ * sporadic job, so nothing is admitted into its space. A run already released
+ * still runs. k_deadline_event_disarm() alone frees the capacity.
+ *
+ * @isr_ok
+ *
+ * @param event Deadline event of a timed job.
+ *
+ * @retval 0 Paused.
+ * @retval -EPERM The job is non-pausable (@ref k_deadline_reservation.non_pausable).
+ * @retval -EINVAL Not a timed job.
+ */
+int k_deadline_event_pause(struct k_deadline_event *event);
+
+/**
+ * @brief Resume a paused timed job, or bring an unpaused one's next release
+ *        forward to now.
+ *
+ * An activation: it cannot fail. The job is released now, or one period after
+ * its last release if that is later (held, not reported); its period restarts
+ * from that release.
+ *
+ * @isr_ok
+ *
+ * @param event Deadline event of a timed job.
+ *
+ * @retval 0 Released or held.
+ * @retval -EINVAL Not a timed job.
+ */
+int k_deadline_event_resume(struct k_deadline_event *event);
+
+/**
+ * @brief Replace an armed job's declaration.
+ *
+ * @p next (budget, inter-arrival or period, deadline, interrupt budget,
+ * pausability) is admitted against everything else admitted, with the job's
+ * current declaration removed, and the envelope of both charged until the
+ * switch. Admitted, it takes effect at the job's next release (a timed job's
+ * first release under it is at least its period after the last one); the run
+ * in progress completes under the current one. Refused, the current
+ * declaration stays in force. A non-pausable job keeps a non-pausable
+ * declaration. Thread context: the check is admission work.
+ *
+ * @param event Armed deadline event.
+ * @param next New declaration, copied: at the switch the armed reservation takes its values.
+ *
+ * @retval 0 Admitted; takes effect at the next release.
+ * @retval -ETIME Infeasible; reported as K_DEADLINE_MISS_UNSAT for @p event.
+ * @retval -EINVAL Not armed, a change already pending, or a model that cannot hold.
+ * @retval -EPERM @p next would let a non-pausable job pause.
+ */
+int k_deadline_event_change(struct k_deadline_event *event, struct k_deadline_reservation *next);
 
 /**
  * @brief Reserve capacity for an interrupt line.

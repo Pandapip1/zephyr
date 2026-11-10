@@ -883,9 +883,18 @@ ZTEST(deadline_admission, test_rearm_never_refused_under_load)
  * A periodic job is released by the kernel every period and goes back to sleep without a check,
  * under the same load.
  */
+/*
+ * A timed job's period: 5 ms, and at least four ticks, so that its deadline (the period) stays
+ * past a release's lateness when releases ride kernel timeouts.
+ */
+static uint32_t timed_period(void)
+{
+	return k_ticks_to_cyc_floor32(MAX(k_us_to_ticks_ceil32(5000U * scale), 4U));
+}
+
 ZTEST(deadline_admission, test_periodic_resleep_never_refused_under_load)
 {
-	uint32_t period = k_ticks_to_cyc_floor32(k_us_to_ticks_ceil32(5000U * scale));
+	uint32_t period = timed_period();
 	int seen;
 
 	res[JOB_HIGH2] = (struct k_deadline_reservation){
@@ -922,6 +931,235 @@ ZTEST(deadline_admission, test_disarm_releases_capacity)
 	zassert_ok(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 100U, 1000U, 300U)));
 	zassert_equal(misses, 0);
 }
+
+/* A timed job of @p budget_us every @p period, first released one period from now. */
+static uint32_t arm_timed(enum job_id id, uint32_t budget_us, uint32_t period, bool non_pausable)
+{
+	res[id] = (struct k_deadline_reservation){
+		.budget = US(budget_us),
+		.min_interarrival = period,
+		.deadline = period,
+		.non_pausable = non_pausable,
+	};
+	run_us[id] = 0U;
+	int ret = k_deadline_event_arm_periodic(&events[id], &res[id], k_cycle_get_32() + period);
+
+	zassert_equal(ret, 0, "arm %d, timer %d jitter %u deadline %u", ret, res[id].timer,
+		      res[id].jitter, res[id].deadline);
+	return period;
+}
+
+/* Pausing stops the releases; resuming is an activation, so neither can fail. */
+ZTEST(deadline_admission, test_pause_then_resume_never_fails)
+{
+	uint32_t period = arm_timed(JOB_HIGH2, 50U, timed_period(), false);
+	int seen;
+
+	k_sleep(K_CYC(3U * period));
+	zassert_true(runs[JOB_HIGH2] >= 2, "not released before the pause");
+	zassert_ok(k_deadline_event_pause(&events[JOB_HIGH2]));
+	sleep_ms(1U);
+	seen = runs[JOB_HIGH2];
+	k_sleep(K_CYC(3U * period));
+	zassert_equal(runs[JOB_HIGH2], seen, "a paused job was released");
+	zassert_ok(k_deadline_event_resume(&events[JOB_HIGH2]));
+	k_sleep(K_CYC(3U * period));
+	zassert_true(runs[JOB_HIGH2] >= seen + 2, "not released after the resume");
+	zassert_equal(misses, 0, "a pause or resume was checked or refused");
+}
+
+/* A resume within a period of the last release is held until that period ends. */
+ZTEST(deadline_admission, test_early_resume_held_to_its_period)
+{
+	uint32_t period = arm_timed(JOB_HIGH2, 50U, timed_period(), false);
+	uint32_t last;
+	int seen;
+
+	while (runs[JOB_HIGH2] == 0) {
+		k_sleep(K_TICKS(1));
+	}
+	zassert_ok(k_deadline_event_pause(&events[JOB_HIGH2]));
+	seen = runs[JOB_HIGH2];
+	last = res[JOB_HIGH2].last_release;
+	zassert_ok(k_deadline_event_resume(&events[JOB_HIGH2]));
+	k_sleep(K_CYC(2U * period));
+	zassert_true(runs[JOB_HIGH2] > seen, "the held resume was not released");
+	zassert_true((int32_t)(started_at[JOB_HIGH2] - (last + period)) >= 0,
+		     "released %d cycles after the last release, period %u",
+		     (int32_t)(started_at[JOB_HIGH2] - last), period);
+	zassert_equal(misses, 0, "a held resume was reported");
+}
+
+/* A paused job keeps its capacity: work that only fits without it is refused. */
+ZTEST(deadline_admission, test_paused_capacity_not_given_away)
+{
+	uint32_t period = timed_period();
+
+	res[JOB_HIGH2] = (struct k_deadline_reservation){
+		.budget = US(600U),
+		.min_interarrival = period,
+		.deadline = period,
+	};
+	zassert_ok(k_deadline_event_arm_periodic(&events[JOB_HIGH2], &res[JOB_HIGH2],
+						 k_cycle_get_32() + period));
+	zassert_ok(k_deadline_event_pause(&events[JOB_HIGH2]));
+	zassert_equal(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 100U, 1000U, 300U)),
+		      -ETIME, "a paused job's capacity was given to another request");
+	k_deadline_event_disarm(&events[JOB_HIGH2]);
+	misses = 0;
+	zassert_ok(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 100U, 1000U, 300U)));
+}
+
+/* A non-pausable job refuses a pause and keeps being released. */
+ZTEST(deadline_admission, test_non_pausable_job_refuses_pause)
+{
+	uint32_t period = arm_timed(JOB_HIGH2, 50U, timed_period(), true);
+	int seen;
+
+	zassert_equal(k_deadline_event_pause(&events[JOB_HIGH2]), -EPERM);
+	seen = runs[JOB_HIGH2];
+	k_sleep(K_CYC(3U * period));
+	zassert_true(runs[JOB_HIGH2] >= seen + 2, "a refused pause stopped the job");
+}
+
+/* A feasible change takes effect at the job's next release, not before. */
+ZTEST(deadline_admission, test_change_applies_at_next_release)
+{
+	struct k_deadline_reservation next = {
+		.budget = US(200U),
+		.min_interarrival = US(1000U),
+		.deadline = US(500U),
+	};
+
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 100U, 1000U, 500U)));
+	zassert_ok(k_deadline_event_change(&events[JOB_HIGH], &next));
+	zassert_equal(res[JOB_HIGH].budget, US(100U), "the change took effect before a release");
+	irq_offload(activate, INT_TO_POINTER(JOB_HIGH));
+	sleep_ms(2U);
+	zassert_equal(runs[JOB_HIGH], 1);
+	zassert_equal(res[JOB_HIGH].budget, US(200U), "the change did not take effect");
+	zassert_equal(misses, 0);
+}
+
+/* A timed job's first release under a changed period is that period after the last one. */
+ZTEST(deadline_admission, test_changed_period_spaces_from_last_release)
+{
+	uint32_t period = arm_timed(JOB_HIGH2, 50U, timed_period(), false);
+	struct k_deadline_reservation next = {
+		.budget = US(50U),
+		.min_interarrival = 2U * period,
+		.deadline = period,
+	};
+	uint32_t last;
+	int seen;
+
+	while (runs[JOB_HIGH2] == 0) {
+		k_sleep(K_TICKS(1));
+	}
+	seen = runs[JOB_HIGH2];
+	last = res[JOB_HIGH2].last_release;
+	zassert_ok(k_deadline_event_change(&events[JOB_HIGH2], &next));
+	k_sleep(K_CYC(3U * period));
+	zassert_true(runs[JOB_HIGH2] > seen, "not released under the change");
+	zassert_equal(res[JOB_HIGH2].last_release, last + 2U * period,
+		      "first release under the change %d cycles after the last, not %u",
+		      (int32_t)(res[JOB_HIGH2].last_release - last), 2U * period);
+}
+
+/* An infeasible change is refused and reported; the declaration in force stays. */
+ZTEST(deadline_admission, test_infeasible_change_refused_keeps_old)
+{
+	struct k_deadline_reservation next = {
+		.budget = US(750U),
+		.min_interarrival = US(1000U),
+		.deadline = US(1000U),
+	};
+
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 600U, 1000U, 1000U)));
+	zassert_ok(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 100U, 1000U, 700U)));
+	/* The low job would start after 750 us of the high one: past 700. */
+	zassert_equal(k_deadline_event_change(&events[JOB_HIGH], &next), -ETIME);
+	zassert_equal(misses, 1);
+	zassert_equal(last_miss.kind, K_DEADLINE_MISS_UNSAT);
+	irq_offload(activate, INT_TO_POINTER(JOB_HIGH));
+	sleep_ms(2U);
+	zassert_equal(res[JOB_HIGH].budget, US(600U), "a refused change took effect");
+	zassert_equal(res[JOB_HIGH].adm_budget, US(600U), "a refused change is still charged");
+	/* The old declaration still holds the load exactly where it was. */
+	zassert_equal(k_deadline_event_arm(&events[JOB_HIGH2], reserve(JOB_HIGH2, 150U, 1000U,
+								     1000U)),
+		      -ETIME);
+}
+
+/* A change that only reduces demand always passes. */
+ZTEST(deadline_admission, test_reducing_change_passes)
+{
+	struct k_deadline_reservation next = {
+		.budget = US(300U),
+		.min_interarrival = US(2000U),
+		.deadline = US(1000U),
+	};
+
+	zassert_ok(k_deadline_event_arm(&events[JOB_HIGH], reserve(JOB_HIGH, 600U, 1000U, 1000U)));
+	zassert_ok(k_deadline_event_arm(&events[JOB_LOW], reserve(JOB_LOW, 100U, 1000U, 700U)));
+	zassert_ok(k_deadline_event_change(&events[JOB_HIGH], &next));
+	zassert_equal(misses, 0);
+}
+
+/* A non-pausable job cannot change into a pausable one. */
+ZTEST(deadline_admission, test_non_pausable_change_keeps_non_pausable)
+{
+	struct k_deadline_reservation next = {
+		.budget = US(50U),
+		.min_interarrival = timed_period(),
+		.deadline = timed_period(),
+	};
+
+	(void)arm_timed(JOB_HIGH2, 50U, timed_period(), true);
+	zassert_equal(k_deadline_event_change(&events[JOB_HIGH2], &next), -EPERM);
+}
+
+#ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB
+static volatile uint32_t timer_fired[2];
+
+static void timer_expiry(struct k_timer *timer)
+{
+	timer_fired[POINTER_TO_INT(k_timer_user_data_get(timer))] = k_cycle_get_32();
+}
+
+/*
+ * Timeouts expire in the announcing job at their tick: one due shortly after another is served
+ * on time, within its tick and the job's start-by, not spaced from the first.
+ */
+ZTEST(deadline_admission, test_close_timeouts_expire_on_time)
+{
+	static struct k_timer timers[2];
+	uint32_t start;
+	uint32_t due[2];
+	uint32_t bound;
+
+	bound = k_ticks_to_cyc_ceil32(1) +
+		k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS) + US(50U);
+	for (int i = 0; i < 2; i++) {
+		k_timer_init(&timers[i], timer_expiry, NULL);
+		k_timer_user_data_set(&timers[i], INT_TO_POINTER(i));
+		timer_fired[i] = 0U;
+	}
+	start = k_cycle_get_32();
+	due[0] = start + k_us_to_cyc_ceil32(2000U);
+	due[1] = start + k_us_to_cyc_ceil32(2100U);
+	k_timer_start(&timers[0], K_USEC(2000U), K_NO_WAIT);
+	k_timer_start(&timers[1], K_USEC(2100U), K_NO_WAIT);
+	sleep_ms(5U);
+	for (int i = 0; i < 2; i++) {
+		zassert_true(timer_fired[i] != 0U, "timer %d did not fire", i);
+		zassert_true((int32_t)(timer_fired[i] - due[i]) <= (int32_t)bound,
+			     "timer %d fired %d cycles after its time, bound %u", i,
+			     (int32_t)(timer_fired[i] - due[i]), bound);
+	}
+	zassert_equal(misses, 0);
+}
+#endif
 
 /*
  * An activation outside the declared model (here a second one while the first is still

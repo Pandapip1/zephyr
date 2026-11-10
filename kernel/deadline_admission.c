@@ -398,8 +398,8 @@ static void sim_add_reservation(struct sim *s, struct k_deadline_event *event,
 	/* An interrupt line's (no event) has no thread work, only its handler. */
 	*j = (struct sim_job){
 		.event = event,
-		.deadline = (int32_t)res->deadline,
-		.work = (event != NULL) ? res->budget : 0U,
+		.deadline = (int32_t)res->adm_deadline,
+		.work = (event != NULL) ? res->adm_budget : 0U,
 		.prio = (event != NULL) ? event->consumer->base.prio : K_HIGHEST_THREAD_PRIO - 1,
 		.cooperative = (event != NULL) && (event->consumer->base.prio < 0),
 		.res = res,
@@ -469,11 +469,11 @@ static uint64_t sim_recurring(const struct sim *s, const struct sim_job *a, uint
 		const struct sim_job *k = &s->jobs[i];
 		uint64_t releases;
 
-		if (k->res == NULL || k->event == a->event) {
+		if (k->res == NULL || k == a || (k->event != NULL && k->event == a->event)) {
 			continue;
 		}
-		releases = (x + k->res->jitter) / k->res->min_interarrival + 1U;
-		demand += releases * k->res->isr_budget;
+		releases = (x + k->res->jitter) / k->res->adm_min_interarrival + 1U;
+		demand += releases * k->res->adm_isr_budget;
 		if (k->prio <= a->prio) {
 			demand += releases * k->work;
 		}
@@ -908,6 +908,48 @@ static void admission_report(const struct admission_verdict *verdict, struct k_t
 	z_deadline_miss_report(&miss);
 }
 
+/*
+ * A model that can hold: one run outstanding needs D <= T and C + isr <= T, and
+ * a time comparable on the 32-bit clock needs T < 2^31.
+ */
+static bool model_holds(uint32_t budget, uint32_t min_interarrival, uint32_t deadline,
+			uint32_t isr_budget)
+{
+	return budget != 0U && min_interarrival != 0U && min_interarrival <= INT32_MAX &&
+	       deadline <= min_interarrival &&
+	       (uint64_t)budget + isr_budget <= min_interarrival;
+}
+
+/*
+ * Admission charges @p res as declared. A timed release can be delivered up to
+ * its jitter late: its own start-by is checked that much earlier.
+ */
+static void res_charge_self(struct k_deadline_reservation *res)
+{
+	res->adm_budget = res->budget;
+	res->adm_min_interarrival = res->min_interarrival;
+	res->adm_deadline = res->deadline - (res->periodic ? res->jitter : 0U);
+	res->adm_isr_budget = res->isr_budget;
+}
+
+/* A pending change takes effect: @p res holds the new declaration. Caller holds the lock. */
+static void change_apply(struct k_deadline_reservation *res)
+{
+	if (!res->change.pending) {
+		return;
+	}
+	res->budget = res->change.budget;
+	res->min_interarrival = res->change.min_interarrival;
+	res->deadline = res->change.deadline;
+	res->isr_budget = res->change.isr_budget;
+	res->non_pausable = res->change.non_pausable;
+	res->change.pending = false;
+	res_charge_self(res);
+	if (res->event != NULL) {
+		res->event->budget = res->budget;
+	}
+}
+
 void k_deadline_event_budget_set(struct k_deadline_event *event, uint32_t budget)
 {
 	k_spinlock_key_t key = z_sched_spinlock_lock();
@@ -924,12 +966,20 @@ void k_deadline_event_budget_set(struct k_deadline_event *event, uint32_t budget
 void z_deadline_admission_publication(const struct k_deadline_event *event, uint32_t now,
 				      int *deadline, uint32_t *budget)
 {
-	const struct k_deadline_reservation *res = event->reservation;
+	struct k_deadline_reservation *res = event->reservation;
 
-	if (res != NULL) {
-		*deadline = (int)(now + res->deadline);
-		*budget = res->budget;
+	if (res == NULL) {
+		return;
 	}
+	if (!res->periodic) {
+		/* A sporadic job's change takes effect at its next release: this one. */
+		change_apply(res);
+		*deadline = (int)(now + res->deadline);
+	} else {
+		/* A timed release's start-by counts from its time, not its delivery. */
+		*deadline = (int)(res->last_release + res->deadline);
+	}
+	*budget = res->budget;
 }
 
 /*
@@ -966,7 +1016,9 @@ bool z_deadline_admission_posted(struct k_deadline_event *event, bool idle, uint
 			return false;
 		}
 		res->released = true;
-		res->last_release = now;
+		if (!res->periodic) {
+			res->last_release = now;
+		}
 		event->future = false;
 		event->admission_state = ADMIT_PENDING;
 		return true;
@@ -1382,24 +1434,241 @@ int k_deadline_demand_admit(int prio, uint32_t cycles)
 }
 
 /*
- * A periodic reservation's release. The next one is scheduled here, at the
- * release, not when the run finishes: going back to sleep cannot fail.
+ * Timed jobs. Each release has a time and is put on a release timer: a
+ * scheduler clock event of the kernel's pool, delivered at that time, or
+ * without one a kernel timeout, at the first tick from it. The next release is
+ * scheduled when one is made, from the release's time, never when a run
+ * finishes: going back to sleep cannot fail.
  */
-static void periodic_release(struct _timeout *timeout)
-{
-	struct k_deadline_reservation *res =
-		CONTAINER_OF(timeout, struct k_deadline_reservation, timeout);
-	k_spinlock_key_t key = z_sched_spinlock_lock();
-	bool armed = (res->event != NULL) && (res->event->reservation == res);
+#if defined(CONFIG_CLOCK_EVENT_SCHED) && (CONFIG_SCHED_DEADLINE_TIMED_JOBS > 0)
+#define TIMED_POOL CONFIG_SCHED_DEADLINE_TIMED_JOBS
+static struct k_clock_event timed_ce[TIMED_POOL];
+static struct k_deadline_reservation *timed_owner[TIMED_POOL];
+static bool timed_bound[TIMED_POOL];
+#else
+#define TIMED_POOL 0
+#endif
 
-	z_sched_spinlock_unlock(key);
-	if (!armed) {
+static void timed_fire(struct k_deadline_reservation *res);
+
+#if TIMED_POOL > 0
+static void timed_ce_expired(struct k_clock_event *ce, uint32_t generation, void *user_data)
+{
+	struct k_deadline_reservation *res = timed_owner[POINTER_TO_INT(user_data)];
+
+	ARG_UNUSED(ce);
+	ARG_UNUSED(generation);
+	if (res != NULL) {
+		timed_fire(res);
+	}
+}
+#endif
+
+static void timed_timeout_expired(struct _timeout *timeout)
+{
+	timed_fire(CONTAINER_OF(timeout, struct k_deadline_reservation, timeout));
+}
+
+/* A clock event of the pool for @p res: its index, or -1 for none. Thread context. */
+static int8_t timed_take(struct k_deadline_reservation *res)
+{
+#if TIMED_POOL > 0
+	for (int i = 0; i < TIMED_POOL; i++) {
+		k_spinlock_key_t key = z_sched_spinlock_lock();
+		bool taken = timed_owner[i] == NULL;
+
+		if (taken) {
+			timed_owner[i] = res;
+		}
+		z_sched_spinlock_unlock(key);
+		if (!taken) {
+			continue;
+		}
+		if (!timed_bound[i]) {
+			timed_bound[i] = k_clock_event_sched_init(&timed_ce[i], timed_ce_expired,
+								  INT_TO_POINTER(i)) == 0;
+		}
+		if (timed_bound[i]) {
+			return (int8_t)i;
+		}
+		key = z_sched_spinlock_lock();
+		timed_owner[i] = NULL;
+		z_sched_spinlock_unlock(key);
+		break;
+	}
+#else
+	ARG_UNUSED(res);
+#endif
+	return -1;
+}
+
+/* Give @p res's clock event back to the pool. Caller holds the lock. */
+static void timed_give_locked(struct k_deadline_reservation *res)
+{
+#if TIMED_POOL > 0
+	if (res->timer >= 0) {
+		timed_owner[res->timer] = NULL;
+	}
+#endif
+	res->timer = -1;
+}
+
+/*
+ * Put @p res's next release on its timer. Caller holds the lock. False when it is
+ * too close to arm: the caller waits it out (at most the timer's arm lead) and
+ * releases it itself.
+ */
+static bool timed_arm_locked(struct k_deadline_reservation *res)
+{
+#if TIMED_POOL > 0
+	if (res->timer >= 0) {
+		return k_clock_event_arm_abs(&timed_ce[res->timer], res->next_release) == 0;
+	}
+#endif
+	int32_t until = (int32_t)(res->next_release - k_cycle_get_32());
+
+	if (until <= 0) {
+		return false;
+	}
+	(void)z_try_abort_timeout(&res->timeout);
+	(void)z_add_timeout(&res->timeout, timed_timeout_expired,
+			    K_TIMEOUT_ABS_TICKS(sys_clock_tick_get() +
+					       (k_ticks_t)k_cyc_to_ticks_ceil64((uint64_t)until)));
+	return true;
+}
+
+static void timed_cancel_locked(struct k_deadline_reservation *res)
+{
+#if TIMED_POOL > 0
+	if (res->timer >= 0) {
+		k_clock_event_cancel(&timed_ce[res->timer]);
 		return;
 	}
-	res->next_tick += res->period_ticks;
-	(void)z_add_timeout(&res->timeout, periodic_release, K_TIMEOUT_ABS_TICKS(res->next_tick));
+#endif
+	(void)z_try_abort_timeout(&res->timeout);
+}
+
+static void timed_wait(uint32_t at)
+{
+	while ((int32_t)(at - k_cycle_get_32()) > 0) {
+		arch_nop();
+	}
+}
+
+/*
+ * Make @p res's next release at @p at: on its timer, or, too close for that, after
+ * a wait for it here. Takes the lock from @p key and releases it.
+ */
+static void timed_schedule(struct k_deadline_reservation *res, uint32_t at, k_spinlock_key_t key)
+{
+	bool armed;
+
+	res->next_release = at;
+	res->scheduled = true;
+	armed = res->paused || timed_arm_locked(res);
+	z_sched_spinlock_unlock(key);
+	if (!armed) {
+		timed_wait(at);
+		timed_fire(res);
+	}
+}
+
+/*
+ * A timed job's release, at its time. A pending change takes effect with it,
+ * then the next release is scheduled one period from this one.
+ */
+static void timed_fire(struct k_deadline_reservation *res)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	struct k_deadline_event *event = res->event;
+	uint32_t next;
+	bool armed;
+
+	if (event == NULL || event->reservation != res || res->paused || !res->scheduled) {
+		z_sched_spinlock_unlock(key);
+		return;
+	}
+	change_apply(res);
+	res->last_release = res->next_release;
+	res->released = true;
+	next = res->last_release + res->min_interarrival;
+	res->next_release = next;
+	armed = timed_arm_locked(res);
+	z_sched_spinlock_unlock(key);
 	/* The reservation sets the run's deadline and budget (z_deadline_admission_publication()). */
-	k_deadline_event_post(res->event, 0);
+	k_deadline_event_post(event, 0);
+	if (!armed) {
+		timed_wait(next);
+		timed_fire(res);
+	}
+}
+
+/* The timed job of @p event, or NULL. Caller holds the lock. */
+static struct k_deadline_reservation *timed_of(struct k_deadline_event *event)
+{
+	struct k_deadline_reservation *res = event->reservation;
+
+	return (res != NULL && res->periodic) ? res : NULL;
+}
+
+int k_deadline_event_release_at(struct k_deadline_event *event, uint32_t at)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	struct k_deadline_reservation *res = timed_of(event);
+
+	if (res == NULL) {
+		z_sched_spinlock_unlock(key);
+		return -EINVAL;
+	}
+	if (res->released &&
+	    (int32_t)(at - (res->last_release + res->min_interarrival)) < 0) {
+		at = res->last_release + res->min_interarrival;
+	}
+	timed_schedule(res, at, key);
+	return 0;
+}
+
+int k_deadline_event_pause(struct k_deadline_event *event)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	struct k_deadline_reservation *res = timed_of(event);
+	int ret = 0;
+
+	if (res == NULL) {
+		ret = -EINVAL;
+	} else if (res->non_pausable) {
+		ret = -EPERM;
+	} else {
+		res->paused = true;
+		timed_cancel_locked(res);
+	}
+	z_sched_spinlock_unlock(key);
+	return ret;
+}
+
+int k_deadline_event_resume(struct k_deadline_event *event)
+{
+	k_spinlock_key_t key = z_sched_spinlock_lock();
+	struct k_deadline_reservation *res = timed_of(event);
+	uint32_t at = k_cycle_get_32();
+
+	if (res == NULL) {
+		z_sched_spinlock_unlock(key);
+		return -EINVAL;
+	}
+	/* Held, not reported: within a period of the last release it waits for the period. */
+	if (res->released &&
+	    (int32_t)(at - (res->last_release + res->min_interarrival)) < 0) {
+		at = res->last_release + res->min_interarrival;
+	}
+	if (!res->paused && res->scheduled && (int32_t)(res->next_release - at) <= 0) {
+		/* Already due as soon. */
+		z_sched_spinlock_unlock(key);
+		return 0;
+	}
+	res->paused = false;
+	timed_schedule(res, at, key);
+	return 0;
 }
 
 static int arm(struct k_deadline_event *event, struct k_deadline_reservation *res, bool periodic,
@@ -1411,33 +1680,46 @@ static int arm(struct k_deadline_event *event, struct k_deadline_reservation *re
 	bool ok;
 	k_spinlock_key_t key;
 
-	if (event->consumer == NULL || res->budget == 0U || res->min_interarrival == 0U ||
-	    res->deadline > res->min_interarrival ||
-	    (uint64_t)res->budget + res->isr_budget > res->min_interarrival) {
-		/* A model that cannot hold: one run outstanding needs D <= T, and C + isr <= T. */
+	if (event->consumer == NULL) {
+		/* A job may arm itself before its first wait. */
+		event->consumer = k_current_get();
+	}
+	if (!model_holds(res->budget, res->min_interarrival, res->deadline, res->isr_budget)) {
 		return -EINVAL;
 	}
 	res->periodic = periodic;
 	res->released = false;
 	res->jitter = 0U;
 	res->irq = -1;
+	res->change.pending = false;
+	res->paused = false;
+	res->scheduled = false;
+	res->timer = -1;
 	if (periodic) {
-		res->period_ticks = k_cyc_to_ticks_floor64(res->min_interarrival);
-		if (res->period_ticks == 0 ||
-		    k_ticks_to_cyc_floor64(res->period_ticks) != res->min_interarrival) {
+		res->timer = timed_take(res);
+		if (res->timer >= 0) {
+#ifdef CONFIG_CLOCK_EVENT_SCHED
+			/* Delivered at its time, or reported late past the service's tolerance. */
+			res->jitter = k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SCHED_LATE_TOLERANCE_NS);
+#endif
+		} else if (IS_ENABLED(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB)) {
+			/* A kernel timeout would add the announcing job's response. */
+			return -EINVAL;
+		} else {
+			/* Announced up to one tick after its time. */
+			res->jitter = k_ticks_to_cyc_ceil32(1);
+		}
+		if (res->jitter >= res->deadline) {
+			key = z_sched_spinlock_lock();
+			timed_give_locked(res);
+			z_sched_spinlock_unlock(key);
 			return -EINVAL;
 		}
-		/* A release is announced up to one tick after its tick. */
-		res->jitter = k_ticks_to_cyc_ceil32(1);
-#ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB
-		/* Then the announcing job serves it: spaced, started by its deadline, its run. */
-		res->jitter += k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_MIN_INTERARRIVAL_NS +
-						  CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS +
-						  CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_BUDGET_NS);
-#endif
 	}
+	res_charge_self(res);
 	key = z_sched_spinlock_lock();
 	if (event->reservation != NULL) {
+		timed_give_locked(res);
 		z_sched_spinlock_unlock(key);
 		return -EINVAL;
 	}
@@ -1449,7 +1731,7 @@ static int arm(struct k_deadline_event *event, struct k_deadline_reservation *re
 	event->budget = res->budget;
 	candidate = (struct sim_job){
 		.event = event,
-		.deadline = (int32_t)res->deadline,
+		.deadline = (int32_t)res->adm_deadline,
 		.work = res->budget,
 		.prio = event->consumer->base.prio,
 		.cooperative = event->consumer->base.prio < 0,
@@ -1466,20 +1748,18 @@ static int arm(struct k_deadline_event *event, struct k_deadline_reservation *re
 		if (budget_before == 0U) {
 			(void)sys_slist_find_and_remove(&admitted, &event->admission_node);
 		}
+		timed_give_locked(res);
 	}
-	z_sched_spinlock_unlock(key);
 	if (!ok) {
+		z_sched_spinlock_unlock(key);
 		admission_report(&verdict, k_current_get());
 		return -ETIME;
 	}
 	if (periodic) {
-		/* The first release, then one every period from it (periodic_release()). */
-		int32_t until = (int32_t)(first - k_cycle_get_32());
-
-		res->next_tick = sys_clock_tick_get() +
-				 (k_ticks_t)k_cyc_to_ticks_ceil64((uint64_t)MAX(until, 0));
-		(void)z_add_timeout(&res->timeout, periodic_release,
-				    K_TIMEOUT_ABS_TICKS(res->next_tick));
+		/* The first release, then one every period from it (timed_fire()). */
+		timed_schedule(res, first, key);
+	} else {
+		z_sched_spinlock_unlock(key);
 	}
 	return 0;
 }
@@ -1504,12 +1784,76 @@ void k_deadline_event_disarm(struct k_deadline_event *event)
 	if (res != NULL) {
 		(void)sys_slist_find_and_remove(&reservations, &res->node);
 		event->reservation = NULL;
+		if (res->periodic) {
+			timed_cancel_locked(res);
+			timed_give_locked(res);
+			res->scheduled = false;
+		}
 		dispatch_decide(k_cycle_get_32());
 	}
 	z_sched_spinlock_unlock(key);
-	if (res != NULL && res->periodic) {
-		(void)z_try_abort_timeout(&res->timeout);
+}
+
+int k_deadline_event_change(struct k_deadline_event *event, struct k_deadline_reservation *next)
+{
+	uint32_t now = k_cycle_get_32();
+	struct admission_verdict verdict;
+	struct k_deadline_reservation *res;
+	uint32_t before[4];
+	k_spinlock_key_t key;
+	bool ok;
+
+	if (!model_holds(next->budget, next->min_interarrival, next->deadline, next->isr_budget)) {
+		return -EINVAL;
 	}
+	key = z_sched_spinlock_lock();
+	res = event->reservation;
+	if (res == NULL || res->change.pending ||
+	    (res->periodic && res->jitter >= next->deadline)) {
+		z_sched_spinlock_unlock(key);
+		return -EINVAL;
+	}
+	if (res->non_pausable && !next->non_pausable) {
+		z_sched_spinlock_unlock(key);
+		return -EPERM;
+	}
+	/*
+	 * Until the switch both declarations can release: charge their envelope,
+	 * and check the job itself against the earlier of the two deadlines. A
+	 * change that only reduces demand charges the current declaration.
+	 */
+	before[0] = res->adm_budget;
+	before[1] = res->adm_min_interarrival;
+	before[2] = res->adm_deadline;
+	before[3] = res->adm_isr_budget;
+	res->adm_budget = MAX(res->budget, next->budget);
+	res->adm_min_interarrival = MIN(res->min_interarrival, next->min_interarrival);
+	res->adm_deadline = MIN(res->deadline, next->deadline) - (res->periodic ? res->jitter : 0U);
+	res->adm_isr_budget = MAX(res->isr_budget, next->isr_budget);
+	ok = admission_check(now, NULL, event, &verdict);
+	if (!ok) {
+		res->adm_budget = before[0];
+		res->adm_min_interarrival = before[1];
+		res->adm_deadline = before[2];
+		res->adm_isr_budget = before[3];
+		z_sched_spinlock_unlock(key);
+		admission_report(&verdict, k_current_get());
+		return -ETIME;
+	}
+	res->change.budget = next->budget;
+	res->change.min_interarrival = next->min_interarrival;
+	res->change.deadline = next->deadline;
+	res->change.isr_budget = next->isr_budget;
+	res->change.non_pausable = next->non_pausable;
+	res->change.pending = true;
+	dispatch_decide(now);
+	if (res->periodic && res->released && res->scheduled) {
+		/* The first release under it is its period after the last one. */
+		timed_schedule(res, res->last_release + next->min_interarrival, key);
+	} else {
+		z_sched_spinlock_unlock(key);
+	}
+	return 0;
 }
 
 /* The reservation of interrupt line @p irq, or NULL. Caller holds the scheduler lock or runs in
@@ -1544,7 +1888,9 @@ int k_irq_reserve(unsigned int irq, struct k_deadline_reservation *reservation)
 	reservation->released = false;
 	reservation->periodic = false;
 	reservation->jitter = 0U;
+	reservation->change.pending = false;
 	reservation->deadline = reservation->min_interarrival;
+	res_charge_self(reservation);
 	key = z_sched_spinlock_lock();
 	if (irq_reservation((int32_t)irq) != NULL) {
 		z_sched_spinlock_unlock(key);

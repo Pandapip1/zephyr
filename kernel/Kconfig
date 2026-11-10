@@ -273,6 +273,19 @@ config SCHED_DEADLINE_ADMISSION_JOBS
 	  check considers. A check that needs more is infeasible: the
 	  release or admission that asked for it is reported unsat.
 
+config SCHED_DEADLINE_TIMED_JOBS
+	int "Timed jobs released on scheduler clock events"
+	depends on SCHED_DEADLINE_ADMISSION && CLOCK_EVENT_SCHED
+	default 2
+	range 0 16
+	help
+	  Scheduler clock events reserved for the releases of timed jobs
+	  (k_deadline_event_arm_periodic()), one per job armed at a time: a
+	  release is delivered at its time, not at the next kernel tick and
+	  not through the kernel's timeouts. Each takes a scheduler clock
+	  client (CONFIG_CLOCK_EVENT_SCHED_CLIENTS). A timed job armed with
+	  none free is released by a kernel timeout instead.
+
 config SCHED_DEADLINE_STATS
 	bool "Record the longest run and start latency of each deadline event"
 	depends on SCHED_DEADLINE

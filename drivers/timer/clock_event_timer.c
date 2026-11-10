@@ -14,8 +14,8 @@
  *
  * With CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB the expiry only releases a deadline
  * job, which announces. From the release until that job has announced and
- * reprogrammed, only the job arms: one release is outstanding at a time, and
- * no two are closer than the job's minimum inter-arrival.
+ * reprogrammed, only the job arms: one release is outstanding at a time. Each
+ * timeout expires at its own tick; nothing spaces them.
  */
 
 #include <zephyr/drivers/timer/system_timer.h>
@@ -44,11 +44,6 @@ static uint64_t announced;
 
 #ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB
 BUILD_ASSERT(IS_ENABLED(CONFIG_TICKLESS_KERNEL), "the announcing job reprograms on announce");
-BUILD_ASSERT(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS <=
-	     CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_MIN_INTERARRIVAL_NS,
-	     "an announcement is due before the next can be released");
-
-#define JOB_MIN_GAP k_ns_to_cyc_ceil64(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_MIN_INTERARRIVAL_NS)
 
 static void announce_job(void *a, void *b, void *c);
 
@@ -61,8 +56,6 @@ static struct k_deadline_event announce_event = {
 };
 /* Released and not yet reprogrammed by the job; under the system clock lock. */
 static bool released;
-/* When the last release was. */
-static uint64_t released_at;
 
 static bool arm_allowed(void)
 {
@@ -83,11 +76,6 @@ static void arm(uint64_t now, uint32_t ticks)
 	if (!arm_allowed()) {
 		return;
 	}
-#ifdef CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB
-	if (deadline < released_at + JOB_MIN_GAP) {
-		deadline = released_at + JOB_MIN_GAP;
-	}
-#endif
 	/*
 	 * A tick boundary inside the service's minimum lead is refused, and so is
 	 * one the clock passes while the arm runs: the service reads the clock
@@ -106,17 +94,16 @@ static void arm(uint64_t now, uint32_t ticks)
 static void timeout_expired(struct k_clock_event *event, uint32_t generation, void *user_data)
 {
 	k_spinlock_key_t key = sys_clock_lock();
-	uint64_t now = k_clock_event_sched_now();
+	uint32_t now = (uint32_t)k_clock_event_sched_now();
 
 	ARG_UNUSED(event);
 	ARG_UNUSED(generation);
 	ARG_UNUSED(user_data);
 	released = true;
-	released_at = now;
 	sys_clock_unlock(key);
 	k_deadline_event_post(&announce_event,
-			      (int)((uint32_t)now +
-				    k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS)));
+			      (int)(now + k_ns_to_cyc_ceil32(
+					  CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS)));
 }
 
 static void announce_job(void *a, void *b, void *c)
@@ -125,18 +112,6 @@ static void announce_job(void *a, void *b, void *c)
 	ARG_UNUSED(b);
 	ARG_UNUSED(c);
 
-#if CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_BUDGET_NS > 0
-	static struct k_deadline_reservation reservation = {
-		.budget = k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_BUDGET_NS),
-		.min_interarrival =
-			k_ns_to_cyc_floor32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_MIN_INTERARRIVAL_NS),
-		.deadline = k_ns_to_cyc_floor32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_DEADLINE_NS),
-		.isr_budget = k_ns_to_cyc_ceil32(CONFIG_CLOCK_EVENT_SYSTEM_TIMER_JOB_ISR_NS),
-	};
-
-	/* A refusal is reported; the job runs either way. */
-	(void)k_deadline_event_arm(&announce_event, &reservation);
-#endif
 	for (;;) {
 		k_spinlock_key_t key;
 		uint64_t now;
